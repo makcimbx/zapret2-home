@@ -752,7 +752,7 @@ async function main() {
 			await faultPage.route('**/*', route => route.abort());
 			const faultSetup = fault === 'missing' ? "const originalRPC = rpc.declare; rpc.declare = spec => spec.method === 'protocols_catalog' || spec.method === 'protocols_status' ? async () => { calls.push({ method: spec.method, args: [] }); throw new Error('Метод protocols_catalog отсутствует: обновите пакет и ACL LuCI.'); } : originalRPC(spec);" : fault === 'corrupt-status' ? "profilesState.protocol = 'quic'; profilesState.state = 'results'; profilesState.results = [{ protocol: 'quic', profile: 'quic_unknown', target: 'youtube_h3', repeat: 1, full_match: true, failure: '', status: 200, bytes: 4096, time_total: 1 }];" : "const originalCatalog = protocolCatalog; protocolCatalog = tcp => { const catalog = originalCatalog(tcp); Object.assign(catalog.groups[1], " + (fault === 'unsupported' ? "{ test_supported: false, test_unavailable_reason: 'Тест недоступен: curl не поддерживает HTTP3.' }" : "{ test_supported: 'true', test_unavailable_reason: '' }") + "); return catalog; };";
 			await faultPage.setContent(html); await faultPage.addStyleTag({ content: css + '\n' + mobileCss });
-			await faultPage.addScriptTag({ content: bootstrap.replace('const page =', faultSetup + 'const page =') });
+			await faultPage.addScriptTag({ content: bootstrap.replace('const page = (function()', faultSetup + 'const page = (function()') });
 			await faultPage.waitForSelector('#zapret2-home'); await faultPage.locator('[data-tab="profiles"] a').click(); await faultPage.locator('#zapret2-protocol-quic').click();
 			ok(await faultPage.locator('#zapret2-quic-profiles-start').isDisabled(), 'QUIC test fails closed for ' + fault + ' at ' + width);
 			if (fault === 'unsupported') {
