@@ -94,7 +94,7 @@ node tests/frontend.browser.js
 
 ## Remote — не CI и не часть публикации
 
-`*_remote.py`, `http_rpc.py`, `http_security.py`, `profiles_http.py`,
+`*_remote.py`, `http_rpc.py`, `profiles_http.py`,
 `browser_reliability.js`, а также корневые `install.py`/`install_live.py`
 предназначены для ранее откалиброванной частной установки. Они используют пример
 `192.168.1.1`, SSH/ubus/HTTP, могут устанавливать пакет, менять службу, конфигурацию,
