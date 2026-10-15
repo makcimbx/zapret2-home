@@ -1,0 +1,16 @@
+{
+  "version": "8.23.0",
+  "path": "/usr/lib/zapret2-home/curl-http3",
+  "sha256": "a5b0f6cde4b0e0d6be09bd92ee24fc63f8a3cb20810bc3dc531ee33f0a2d8ae9",
+  "archive_sha256": "4db6c9b5e7f61f6a8cfa7f83e8c24e54259334bbb46743f6207ffb67bc0d1c3a",
+  "release_url": "https://github.com/stunnel/static-curl/releases/tag/8.23.0",
+  "archive_url": "https://github.com/stunnel/static-curl/releases/download/8.23.0/curl-linux-aarch64-musl-8.23.0.tar.xz",
+  "build_source_commit": "e2acbcd219422678ae616982e316d15ba97cb2bd",
+  "build_source_url": "https://github.com/stunnel/static-curl/tree/e2acbcd219422678ae616982e316d15ba97cb2bd",
+  "ca_bundle": "/etc/ssl/certs/ca-certificates.crt",
+  "system_curl_replaced": false,
+  "independently_reproduced": false,
+  "dev_relink_materials_url": "https://github.com/stunnel/static-curl/releases/download/8.23.0/curl-linux-aarch64-dev-8.23.0.tar.xz",
+  "dev_archive_sha256": "d20872203fc3e506356301ee6a3a49fddd995c96740b93d1b12399168b9829ca",
+  "public_redistribution_compliance_complete": false
+}

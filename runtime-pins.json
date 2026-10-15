@@ -1,0 +1,8 @@
+{
+  "nfqws2": "8788877cd4b3140357dd10524832ca508d47055efae072bc426b887bfea253a7",
+  "nfqws2-quic": "5a40e3e823082a5788c7bc7d4e78ed9d2d5c6edb37f4580e300700694adac23b",
+  "curl-http3": "a5b0f6cde4b0e0d6be09bd92ee24fc63f8a3cb20810bc3dc531ee33f0a2d8ae9",
+  "lua/zapret-lib.lua": "b67a470f23b00a8d6e732c4e5135a39b224511e0b71809d5f4616adf62674980",
+  "lua/zapret-antidpi.lua": "31c9dd75b0bd55e98e5306293f2be81e9d2ecadcbbf9157394ff37dcff7dc85a",
+  "lua/hostfakesplit-alt1.lua": "5fbff00e93fd6ef14e6ddda03036033b598b5f35fe4224b3b7d5766f746e9579"
+}

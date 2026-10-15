@@ -1,0 +1,19 @@
+name: Source checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m compileall -q build.py install.py install_live.py src tests
+      - run: node --test tests/frontend.test.js
+      - run: python3 tests/build_inputs.test.py
+      - run: python3 tests/local_harness.test.py

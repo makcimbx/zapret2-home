@@ -1,0 +1,10 @@
+Private diagnostic client from stunnel/static-curl 8.23.0. System curl is not replaced.
+Build source: https://github.com/stunnel/static-curl/tree/e2acbcd219422678ae616982e316d15ba97cb2bd
+Release: https://github.com/stunnel/static-curl/releases/tag/8.23.0
+Matching development libraries/notices: https://github.com/stunnel/static-curl/releases/download/8.23.0/curl-linux-aarch64-dev-8.23.0.tar.xz
+Sources for LGPL components:
+https://mirrors.kernel.org/gnu/libidn/libidn2-2.3.8.tar.gz
+https://mirrors.kernel.org/gnu/libunistring/libunistring-1.4.2.tar.xz
+Musl notices: https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT
+Compiler runtime exception: https://gcc.gnu.org/onlinedocs/libstdc++/manual/license.html
+Publisher digest and actual ELF/native execution checked, build not independently reproduced. Exact compiler/musl inventory and full static-LGPL relinking compliance must be completed before public redistribution; this is a private local installation, not a redistributable vendor package certification.

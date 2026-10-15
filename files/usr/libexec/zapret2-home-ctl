@@ -1,0 +1,649 @@
+#!/bin/sh
+# Admission-ABI: 1
+# Fixed operations only. No user-supplied shell, engine args or file paths.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LIB=/usr/lib/zapret2-home
+RUN=/var/run/zapret2-home
+SVC=/etc/init.d/zapret2-home
+TABLE=zapret2_home
+QUEUE=213
+. /usr/share/libubox/jshn.sh
+mkdir -p "$RUN"
+chmod 700 "$RUN"
+LOCKS=''
+lock_state() { ucode "$LIB/lock.uc" "$1" "$2" "$$" "$3" "$4"; }
+unlock_all() {
+ for L in $LOCKS; do lock_state release "$L"; done
+}
+trap unlock_all EXIT
+lock_op() {
+ for N in 1 2 3 4 5 6 7 8 9 10; do
+  if lock_state acquire "$1"; then LOCKS="$1 $LOCKS"; return 0; fi
+  [ -f "$RUN/lifecycle.json" ] && return 1
+  sleep 1
+ done
+ return 1
+}
+err() { json_init; json_add_boolean ok 0; json_add_string error "$1"; json_dump; printf '\n'; return 1; }
+ok() { printf '%s\n' '{"ok":true}'; }
+load_cfg() {
+ C=$(uci -q get zapret2_home.main.clients)
+ D=$(uci -q get zapret2_home.main.destinations)
+ M=$(uci -q get zapret2_home.main.client_mode); M=${M:-selected}
+ LS=$(uci -q get zapret2_home.main.lists)
+ AU=$(uci -q get zapret2_home.main.auto_update); AU=${AU:-0}
+ PF=$(uci -q get zapret2_home.main.profile) || PF=alt1
+ TE=$(uci -q get zapret2_home.main.tcp_enabled) || TE=1
+ QE=$(uci -q get zapret2_home.main.quic_enabled) || QE=0
+ QPF=$(uci -q get zapret2_home.main.quic_profile) || QPF=quic_google
+ UE=$(uci -q get zapret2_home.main.udp_enabled) || UE=0
+ UPF=$(uci -q get zapret2_home.main.udp_profile) || UPF=udp_fake2
+ for B in "$TE" "$QE" "$UE"; do case "$B" in 0|1) ;; *) return 1;; esac; done
+}
+add_protocols() {
+ json_add_boolean tcp_enabled "$TE"; json_add_boolean quic_enabled "$QE"; json_add_string quic_profile "$QPF"
+ json_add_boolean udp_enabled "$UE"; json_add_string udp_profile "$UPF"
+}
+get_protocols() {
+ json_get_var TE tcp_enabled; json_get_var QE quic_enabled; json_get_var QPF quic_profile
+ json_get_var UE udp_enabled; json_get_var UPF udp_profile
+}
+is_running() {
+ [ -f "$RUN/engine.pid" ] || return 1
+ read -r P <"$RUN/engine.pid"
+ case "$P" in ''|*[!0-9]*) return 1;; esac
+ [ "$(readlink /proc/$P/exe 2>/dev/null)" = "$LIB/nfqws2" ] && kill -0 "$P" 2>/dev/null
+}
+worker_alive() {
+ [ -f "$RUN/worker.pid" ] || return 1
+ read -r WP <"$RUN/worker.pid"
+ case "$WP" in ''|*[!0-9]*) return 1;; esac
+ kill -0 "$WP" 2>/dev/null || return 1
+ tr '\000' '\n' <"/proc/$WP/cmdline" 2>/dev/null | grep -Fx /usr/libexec/zapret2-home-worker >/dev/null
+}
+validated_cfg() {
+ load_cfg || return 1
+ json_init; json_add_string clients "$C"; json_add_string destinations "$D"; json_add_boolean autostart 0
+ json_add_string client_mode "$M"; json_add_string lists "$LS"; json_add_boolean auto_update "$AU"; json_add_string profile "$PF"
+ add_protocols
+ V=$(json_dump | ucode "$LIB/validate.uc") || { printf '%s\n' "$V"; return 1; }
+ json_load "$V"; json_get_var C clients; json_get_var D destinations; json_get_var M client_mode; json_get_var LS lists; json_get_var AU auto_update; json_get_var PF profile; get_protocols
+}
+integrity() { (cd "$LIB" && sha256sum -c SHA256SUMS) >"$RUN/integrity.log" 2>&1; }
+engine_check() {
+ /usr/libexec/zapret2-home-engine "$QUEUE" main dry-run "$TE" "$PF" "$QE" "$QPF" "$UE" "$UPF" >"$RUN/preflight.log" 2>&1
+}
+wan() {
+ W=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device')
+ case "$W" in ''|*[!a-zA-Z0-9_.:-]*) return 1;; esac
+}
+make_rules() {
+ validated_cfg >/dev/null || return 1
+ wan || return 1
+ CSET=$(printf '%s' "$C" | tr ' ' ',')
+ [ "$M" = all ] && CSET='0.0.0.0/0'
+ DSET=$(printf '%s' "$D" | tr ' ' ',')
+ /usr/libexec/zapret2-home-lists ensure || return 1
+ /usr/libexec/zapret2-home-lists elements >"$RUN/list-elements" || return 1
+ {
+  printf 'table inet %s {\n' "$TABLE"
+  printf ' set clients { type ipv4_addr; flags interval; auto-merge; elements = { %s }; }\n' "$CSET"
+  printf ' set destinations { type ipv4_addr; flags interval; auto-merge; elements = { '
+  [ -n "$DSET" ] && printf '%s,' "$DSET"
+  tr '\n' ',' <"$RUN/list-elements"
+  printf ' }; }\n'
+  printf ' set excluded { type ipv4_addr; flags interval; auto-merge; elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3, 192.0.2.1/32 }; }\n'
+  printf ' chain direct_out { type filter hook postrouting priority 90; policy accept;\n'
+  printf '  ip daddr @excluded return\n'
+  printf '  meta mark & 0x00100000 != 0 return\n'
+  printf '  ct status dnat return\n'
+  if [ "$TE" = 1 ]; then
+   printf '  iifname "br-lan" oifname "%s" ip saddr @clients ip daddr @destinations tcp dport 443 ct mark 0 counter ct mark set 0x005a1723\n' "$W"
+   printf '  iifname "br-lan" oifname "%s" ip saddr @clients ip daddr @destinations tcp dport 443 ct mark 0x005a1723 ct original packets <= 20 counter queue num %s bypass\n' "$W" "$QUEUE"
+  fi
+  for GROUP in quic udp; do
+   case "$GROUP" in quic) [ "$QE" = 1 ] || continue; PORTS=443;; udp) [ "$UE" = 1 ] || continue; PORTS='{ 19294-19344, 50000-50100 }';; esac
+   printf '  iifname "br-lan" oifname "%s" ip saddr @clients ip daddr @destinations udp dport %s ct mark 0 counter ct mark set 0x005a1723\n' "$W" "$PORTS"
+   printf '  iifname "br-lan" oifname "%s" ip saddr @clients ip daddr @destinations udp dport %s ct mark 0x005a1723 ct direction original ct original packets <= 20 counter queue num %s bypass\n' "$W" "$PORTS" "$QUEUE"
+  done
+  printf ' }\n'
+  printf ' chain direct_in { type filter hook forward priority 10; policy accept;\n'
+  if [ "$TE" = 1 ]; then
+   printf '  iifname "%s" oifname "br-lan" ct mark 0x005a1723 tcp sport 443 tcp flags & (syn | ack) == (syn | ack) counter queue num %s bypass\n' "$W" "$QUEUE"
+  fi
+  printf ' }\n'
+  printf ' chain fake_route { type route hook output priority -160; policy accept;\n'
+  printf '  meta mark & 0x00100000 != 0 return\n'
+  printf '  ct status dnat return\n'
+  if [ "$TE" = 1 ]; then
+   printf '  meta mark & 0x40000000 != 0 ip saddr @clients ip daddr @destinations ip daddr != @excluded tcp dport 443 counter meta mark set 0x00200000\n'
+  fi
+  for GROUP in quic udp; do
+   case "$GROUP" in quic) [ "$QE" = 1 ] || continue; PORTS=443;; udp) [ "$UE" = 1 ] || continue; PORTS='{ 19294-19344, 50000-50100 }';; esac
+   printf '  meta mark & 0x40000000 != 0 ip saddr @clients ip daddr @destinations ip daddr != @excluded udp dport %s counter meta mark set 0x00200000\n' "$PORTS"
+  done
+  printf ' }\n}\n'
+ } >"$RUN/rules.nft"
+ if nft list table inet "$TABLE" >/dev/null 2>&1; then
+  [ -f "$RUN/owner" ] || return 1
+  { printf 'delete table inet %s\n' "$TABLE"; dd if="$RUN/rules.nft" 2>/dev/null; } >"$RUN/check-rules.nft"
+ else
+  cp "$RUN/rules.nft" "$RUN/check-rules.nft"
+ fi
+ nft -c -f "$RUN/check-rules.nft" >"$RUN/nft-check.log" 2>&1
+}
+prepare() {
+ lock_op rules || { err 'Правила заняты другой операцией'; return 1; }
+ integrity || { err 'Проверка хэшей ядра/Lua не пройдена'; return 1; }
+ validated_cfg >/dev/null || { err 'Некорректная область обработки'; return 1; }
+ read -r ACCT </proc/sys/net/netfilter/nf_conntrack_acct
+ [ "$ACCT" = 1 ] || { err 'Для ограничения первыми пакетами требуется уже включённый nf_conntrack_acct=1'; return 1; }
+ if nft list table inet "$TABLE" >/dev/null 2>&1 && [ ! -f "$RUN/owner" ]; then err 'Имя nft-таблицы занято другой службой'; return 1; fi
+ if ! is_running; then
+  while read -r q rest; do [ "$q" = "$QUEUE" ] && { err 'NFQUEUE занята'; return 1; }; done </proc/net/netfilter/nfnetlink_queue
+ fi
+ engine_check || { err 'Ядро/Lua не прошли dry-run'; return 1; }
+ make_rules || { err 'Проверка nftables не пройдена'; return 1; }
+}
+apply() {
+ EXPECTED="$1"
+ lock_op rules || return 1
+ [ ! -f "$RUN/stopping" ] && [ -f "$RUN/requested" ] && is_running || return 1
+ [ -z "$EXPECTED" ] || [ "$EXPECTED" = "$P" ] || return 1
+ if nft list table inet "$TABLE" >/dev/null 2>&1; then
+  [ -f "$RUN/owner" ] || return 1
+  make_rules || return 1
+  { printf 'delete table inet %s\n' "$TABLE"; dd if="$RUN/rules.nft" 2>/dev/null; } >"$RUN/apply.nft"
+ else
+  make_rules || return 1
+  cp "$RUN/rules.nft" "$RUN/apply.nft"
+ fi
+ printf '%s\n' "zapret2-home:$P" >"$RUN/owner"
+ nft -f "$RUN/apply.nft" || return 1
+}
+remove() {
+ EXPECTED="$1"
+ lock_op rules || return 1
+ if [ -f "$RUN/owner" ]; then
+  read -r OWNER <"$RUN/owner"
+  [ -z "$EXPECTED" ] || [ "$OWNER" = "zapret2-home:$EXPECTED" ] || return 0
+  if nft list table inet "$TABLE" >/dev/null 2>&1; then
+   nft delete table inet "$TABLE" || return 1
+   nft list table inet "$TABLE" >/dev/null 2>&1 && return 1
+  fi
+  rm -f "$RUN/owner"
+ elif nft list table inet "$TABLE" >/dev/null 2>&1; then
+  return 1
+ fi
+ return 0
+}
+quiesce() {
+ lock_op shutdown || return 1
+ quiesce_locked; QUIESCE_RC=$?
+ lock_state release shutdown || return 1
+ LOCKS="${LOCKS#shutdown }"
+ return "$QUIESCE_RC"
+}
+quiesce_locked() {
+ rm -f "$RUN/requested"; touch "$RUN/stopping"
+ /usr/libexec/zapret2-home-ctl remove
+ if is_running; then kill "$P" 2>/dev/null; fi
+ for N in 1 2 3 4 5 6 7 8; do
+  if ! is_running && ! worker_alive; then
+   /usr/libexec/zapret2-home-ctl remove || return 1
+   nft list table inet "$TABLE" >/dev/null 2>&1 && return 1
+   return 0
+  fi
+  sleep 1
+ done
+ return 1
+}
+request_start() {
+ lock_op rules || return 1
+ # The worker reclaims its own stale ownership under its guard.
+ if [ -f "$RUN/stopping" ]; then
+  is_running && return 1
+  worker_alive && return 1
+  nft list table inet "$TABLE" >/dev/null 2>&1 && return 1
+  rm -f "$RUN/stopping"
+ fi
+ touch "$RUN/requested"
+}
+status() {
+ load_cfg || { err 'Некорректные сохранённые переключатели протоколов'; return 1; }
+ R=0; is_running && R=1
+ T=0
+ if nft list chain inet "$TABLE" direct_out >"$RUN/counters.txt" 2>/dev/null; then
+  T=1
+  nft list chain inet "$TABLE" direct_in >>"$RUN/counters.txt" 2>/dev/null
+  nft list chain inet "$TABLE" fake_route >>"$RUN/counters.txt" 2>/dev/null
+ fi
+ A=0; "$SVC" enabled && A=1
+ I=0; integrity && I=1
+ json_init
+ json_add_boolean running "$R"; json_add_boolean table_present "$T"; json_add_boolean autostart "$A"; json_add_boolean integrity_ok "$I"
+ json_add_int queue "$QUEUE"; json_add_string engine_version 'v1.0.5.2'; json_add_string package_version '0.4.5'
+ json_add_object protocols
+ for GROUP in tcp quic udp; do
+  case "$GROUP" in tcp) ENABLED=$TE; SELECTED=$PF;; quic) ENABLED=$QE; SELECTED=$QPF;; udp) ENABLED=$UE; SELECTED=$UPF;; esac
+  json_add_object "$GROUP"; json_add_boolean enabled "$ENABLED"; json_add_string profile "$SELECTED"; json_close_object
+ done
+ json_close_object
+ json_add_string profile_id "$PF"
+ PROFILE_TEXT=$(ucode -e 'import { readfile } from "fs"; let p=filter(json(readfile(ARGV[0])),p=>p.id==ARGV[1])[0]; if(!p) exit(1); print(p.strategy);' "$LIB/profile-catalog.json" "$PF") || PROFILE_TEXT='Unknown saved profile'
+ json_add_string profile "$PROFILE_TEXT"
+ json_add_string clients "$C"; json_add_string destinations "$D"
+ json_add_string client_mode "$M"; json_add_string lists "$LS"; json_add_boolean auto_update "$AU"
+ json_add_string rule_counters "$(dd if="$RUN/counters.txt" bs=8192 count=1 2>/dev/null)"
+ json_add_array warnings
+ json_add_string '' 'Только выбранный прямой IPv4: включённые TCP/443, QUIC/443 и ограниченный UDP. VPN-маршруты не изменяются.'
+ json_add_string '' 'QUIC/UDP экспериментальны: IPv6, видео и голос целиком не проверяются.'
+ [ "$I" = 1 ] || json_add_string '' 'Нарушена целостность ядра или Lua.'
+ [ "$R" = "$T" ] || json_add_string '' 'Состояния процесса и nft-таблицы расходятся.'
+ [ -f "$RUN/requested" ] && [ "$R" = 0 ] && json_add_string '' 'Запуск запрошен; ожидание WAN либо ошибка запуска — см. журнал.'
+ json_close_array
+ BASE=$(json_dump)
+ CONFIG_JOB_RUNNING=0; configure_job_alive && CONFIG_JOB_RUNNING=1
+ CONFIG_JOB_ID=''; read -r CONFIG_JOB_ID <"$RUN/configure.job" 2>/dev/null
+ case "$CONFIG_JOB_ID" in *[!0-9]*) CONFIG_JOB_ID='';; esac
+ if [ -n "$CONFIG_JOB_ID" ] && [ "$CONFIG_JOB_RUNNING" = 0 ]; then
+  read -r CONFIG_LOCK_OWNER <"$RUN/control.lock/pid" 2>/dev/null
+  [ "$CONFIG_LOCK_OWNER" = "$CONFIG_JOB_ID" ] && kill -0 "$CONFIG_LOCK_OWNER" 2>/dev/null && CONFIG_JOB_RUNNING=1
+ fi
+ BASE=$(printf '%s\n' "$BASE" | ucode -e 'import { readfile } from "fs";
+  let s=json(readfile("/dev/stdin")), id=ARGV[1], active=ARGV[2]=="1", result=null;
+  try { result=json(readfile(id ? ARGV[0]+"/configure-job."+id+"/result" : ARGV[0]+"/configure-result.json")); } catch(e) {}
+  s.configure_pending=active && !result; s.configure_job_id=id;
+  s.configure_recovery_required=(!!id && !active && !result) || !!result?.recovery_required;
+  if(s.configure_recovery_required) result={ok:false,rolled_back:false,job_id:id,error:"Задание сохранения прервано без результата; требуется проверка восстановления"};
+  s.configure_result=result; print(sprintf("%J\n",s));' "$RUN" "$CONFIG_JOB_ID" "$CONFIG_JOB_RUNNING")
+ CAT=$(/usr/libexec/zapret2-home-lists catalog)
+ META=$(/usr/libexec/zapret2-home-lists status)
+ printf '{"base":%s,"catalog":%s,"meta":%s}\n' "$BASE" "$CAT" "$META" | ucode "$LIB/status-lists.uc"
+}
+# These helpers run under the caller's control lock. Only fixed own-service
+# actions and non-control ctl helpers may be called here; recursive public
+# control/configure would deadlock. prepare runs in a separate process so its
+# rules lock is released before the worker applies the new generation.
+engine_generation() {
+ ucode -e 'import { readfile } from "fs"; let s=readfile("/proc/"+ARGV[0]+"/stat") || "", at=rindex(s,") "), f=split(substr(s,at+2)," "); if(at<0 || f[0]=="Z" || !f[19]) exit(1); print(ARGV[0]+":"+f[19]);' "$P"
+}
+engine_profile_matches() {
+ ucode "$LIB/protocols.uc" main-match "$P" "$1" "$TE" "$PF" "$QE" "$QPF" "$UE" "$UPF"
+}
+service_confirmed() {
+ [ -f "$RUN/requested" ] && [ ! -f "$RUN/stopping" ] && is_running || return 1
+ [ -f "$RUN/owner" ] || return 1
+ read -r CONFIRMED_OWNER <"$RUN/owner"
+ [ "$CONFIRMED_OWNER" = "zapret2-home:$P" ] || return 1
+ load_cfg || return 1
+ engine_profile_matches "$1" || return 1
+ # Pinned nfqws2 initializes Lua before binding NFQUEUE; presence acknowledges real startup.
+ QUEUE_READY=0
+ while read -r Q REST; do [ "$Q" = "$QUEUE" ] && QUEUE_READY=1; done </proc/net/netfilter/nfnetlink_queue
+ [ "$QUEUE_READY" = 1 ] || return 1
+ nft list table inet "$TABLE" >/dev/null 2>&1
+}
+confirm_start() {
+ for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  if service_confirmed; then
+   CONFIRMED_GENERATION=$(engine_generation) || return 1
+   [ -z "$1" ] || [ "$CONFIRMED_GENERATION" != "$1" ] || return 1
+   return 0
+  fi
+  sleep 1
+ done
+ return 1
+}
+set_autostart() {
+ if [ "$1" = 1 ]; then
+  "$SVC" enable && "$SVC" enabled
+ else
+  "$SVC" disable || return 1
+  "$SVC" enabled && return 1
+  return 0
+ fi
+}
+configure_error() {
+ json_init; json_add_boolean ok 0; json_add_string error "$1"
+ json_add_boolean rolled_back "$2"
+ json_add_boolean recovery_required "${CFG_RECOVERY_REQUIRED:-0}"
+ R=0; is_running && R=1
+ T=0; nft list table inet "$TABLE" >/dev/null 2>&1 && T=1
+ A=0; "$SVC" enabled && A=1
+ Q=0; [ -f "$RUN/requested" ] && Q=1
+ S=0; [ -f "$RUN/stopping" ] && S=1
+ json_add_boolean running "$R"; json_add_boolean table_present "$T"
+ json_add_boolean autostart "$A"; json_add_boolean requested "$Q"; json_add_boolean stopping "$S"
+ json_dump; printf '\n'; return 1
+}
+restore_configure() {
+ CFG_ROLLED_BACK=0
+ # Never rewrite configuration while a failed/new worker can still apply it.
+ # Keep requested cleared and stopping set if cleanup/recovery cannot finish.
+ if [ "$CFG_WAS_RUNNING" = 1 ]; then
+  "$SVC" stop >>"$RUN/action.log" 2>&1
+  quiesce >>"$RUN/action.log" 2>&1 || return 1
+ fi
+ CFG_RESTORED=1
+ uci revert zapret2_home || CFG_RESTORED=0
+ if [ "$CFG_RESTORED" = 1 ]; then
+  CFG_RESTORE=/etc/config/.zapret2_home.restore.$$
+  cp -p "$CFG_BACKUP/config" "$CFG_RESTORE" && mv -f "$CFG_RESTORE" /etc/config/zapret2_home &&
+   cmp -s "$CFG_BACKUP/config" /etc/config/zapret2_home &&
+   uci -q export zapret2_home >"$CFG_BACKUP/restored-export" &&
+   cmp -s "$CFG_BACKUP/export" "$CFG_BACKUP/restored-export" || CFG_RESTORED=0
+  rm -f "$CFG_RESTORE"
+ fi
+ set_autostart "$CFG_WAS_AUTOSTART" >>"$RUN/action.log" 2>&1 || CFG_RESTORED=0
+ [ "$CFG_RESTORED" = 1 ] || return 1
+ if [ "$CFG_WAS_RUNNING" = 1 ]; then
+  if ! "$SVC" start >>"$RUN/action.log" 2>&1 || ! confirm_start "$CFG_OLD_GENERATION"; then
+   "$SVC" stop >>"$RUN/action.log" 2>&1
+   quiesce >>"$RUN/action.log" 2>&1
+   return 1
+  fi
+ else
+  # An initially inactive save never creates engine or pending-WAN intent.
+  is_running && return 1
+  worker_alive && return 1
+  nft list table inet "$TABLE" >/dev/null 2>&1 && return 1
+  [ -f "$RUN/requested" ] && return 1
+  if [ "$CFG_WAS_STOPPING" = 1 ]; then touch "$RUN/stopping"; else rm -f "$RUN/stopping"; fi
+ fi
+ CFG_ROLLED_BACK=1
+ return 0
+}
+configure_failed() {
+ CFG_ERROR="$1"
+ restore_configure >>"$RUN/action.log" 2>&1
+ CFG_ARMED=0
+ if [ "$CFG_ROLLED_BACK" = 1 ]; then
+  rm -rf "$CFG_BACKUP"
+ else
+  # Preserve the entire old config for precise manual recovery on I/O failure.
+  CFG_RECOVERY_REQUIRED=1
+  CFG_ERROR="$CFG_ERROR; восстановление не подтверждено — см. журнал (резервная копия: $CFG_BACKUP)"
+ fi
+ configure_error "$CFG_ERROR" "$CFG_ROLLED_BACK"
+}
+configuration_unchanged() {
+ json_load "$CFG_CANDIDATE" || return 1
+ json_get_var CC clients; json_get_var CD destinations; json_get_var CA autostart
+ json_get_var CM client_mode; json_get_var CL lists; json_get_var CU auto_update; json_get_var CP profile
+ json_get_var CTE tcp_enabled; json_get_var CQE quic_enabled; json_get_var CQP quic_profile
+ json_get_var CUE udp_enabled; json_get_var CUP udp_profile
+ validated_cfg >/dev/null 2>&1 || return 1
+ [ "$CC" = "$C" ] && [ "$CD" = "$D" ] && [ "$CM" = "$M" ] &&
+  [ "$CL" = "$LS" ] && [ "$CU" = "$AU" ] && [ "$CP" = "$PF" ] &&
+  [ "$CTE" = "$TE" ] && [ "$CQE" = "$QE" ] && [ "$CQP" = "$QPF" ] &&
+  [ "$CUE" = "$UE" ] && [ "$CUP" = "$UPF" ] || return 1
+ CURRENT_AUTOSTART=0; "$SVC" enabled && CURRENT_AUTOSTART=1
+ [ "$CA" = "$CURRENT_AUTOSTART" ]
+}
+configure_transaction() {
+ # The detached job already owns control.lock. It outlives rpcd's 30-second
+ # SIGKILL boundary; no router-global timeout setting is changed.
+ # Validate the whole fixed request before touching init, UCI or start intent.
+ CFG_CANDIDATE=$(ucode "$LIB/validate.uc") || {
+  json_load "$CFG_CANDIDATE"; json_get_var CFG_VALIDATION_ERROR error
+  configure_error "${CFG_VALIDATION_ERROR:-Некорректный запрос настроек}" 0; return 1;
+ }
+ CFG_WAS_RUNNING=0; CFG_OLD_PID=''; CFG_OLD_GENERATION=''
+ if is_running; then
+  CFG_WAS_RUNNING=1; CFG_OLD_PID="$P"
+  CFG_OLD_GENERATION=$(engine_generation) || { configure_error 'Не удалось подтвердить поколение ядра' 0; return 1; }
+  service_confirmed legacy || { configure_error 'Состояние службы неполное; сначала подтвердите остановку' 0; return 1; }
+ else
+  worker_alive && { configure_error 'Рабочий процесс ещё не остановлен' 0; return 1; }
+  [ -f "$RUN/requested" ] && { configure_error 'Сначала отмените ожидающий запуск кнопкой остановки' 0; return 1; }
+  nft list table inet "$TABLE" >/dev/null 2>&1 && { configure_error 'Остались правила; сначала подтвердите остановку' 0; return 1; }
+ fi
+ CFG_CHANGES=$(uci -q changes zapret2_home) || { configure_error 'Не удалось проверить состояние UCI' 0; return 1; }
+ [ -z "$CFG_CHANGES" ] || { configure_error 'Есть несохранённые изменения UCI; сначала сохраните или отмените их' 0; return 1; }
+ validated_cfg >"$RUN/configure-check.log" 2>&1 || { configure_error 'Текущие настройки некорректны; безопасное восстановление невозможно' 0; return 1; }
+ if configuration_unchanged; then
+  json_init; json_add_boolean ok 1; json_add_boolean unchanged 1; json_dump; printf '\n'; return 0
+ fi
+ # A real mutation must reject any pre-existing detached source job. Updater
+ # launches share control.lock, held through confirmation to block timers.
+ /usr/libexec/zapret2-home-lists ensure-idle || { configure_error 'Дождитесь завершения обновления списков' 0; return 1; }
+ json_load "$CFG_CANDIDATE"; json_get_var PF profile; get_protocols
+ integrity && engine_check || { configure_error 'Выбранный профиль не прошёл проверку ядра/Lua; настройки не изменены' 0; return 1; }
+ CFG_WAS_AUTOSTART=0; "$SVC" enabled && CFG_WAS_AUTOSTART=1
+ CFG_WAS_STOPPING=0; [ -f "$RUN/stopping" ] && CFG_WAS_STOPPING=1
+ CFG_BACKUP="$RUN/configure.$$"
+ mkdir -m 700 "$CFG_BACKUP" || { configure_error 'Не удалось создать резервную копию UCI; настройки не изменены' 0; return 1; }
+ cp -p /etc/config/zapret2_home "$CFG_BACKUP/config" &&
+  cmp -s /etc/config/zapret2_home "$CFG_BACKUP/config" &&
+  uci -q export zapret2_home >"$CFG_BACKUP/export" || {
+   rm -rf "$CFG_BACKUP"; configure_error 'Не удалось создать резервную копию UCI; настройки не изменены' 0; return 1;
+  }
+ CFG_ARMED=1
+ if [ "$CFG_WAS_RUNNING" = 1 ]; then
+  if ! "$SVC" stop >"$RUN/action.log" 2>&1 || ! quiesce >>"$RUN/action.log" 2>&1; then
+   CFG_ARMED=0
+   rm -rf "$CFG_BACKUP"
+   configure_error 'Не удалось подтвердить остановку процесса и удаление правил; настройки не изменены' 0
+   return 1
+  fi
+ fi
+ json_load "$CFG_CANDIDATE"; json_get_var C clients; json_get_var D destinations; json_get_var A autostart
+ json_get_var M client_mode; json_get_var LS lists; json_get_var AU auto_update; json_get_var PF profile; get_protocols
+ if [ -n "$CFG_BRANCH" ]; then
+  case "$CFG_BRANCH" in
+   tcp) BE=$TE; BP=$PF; PK=profile;;
+   quic) BE=$QE; BP=$QPF; PK=quic_profile;;
+   udp) BE=$UE; BP=$UPF; PK=udp_profile;;
+   *) configure_failed 'Некорректная ветвь протокола'; return 1;;
+  esac
+  uci set "zapret2_home.main.${CFG_BRANCH}_enabled=$BE" && uci set "zapret2_home.main.$PK=$BP" && uci commit zapret2_home || {
+   configure_failed 'Не удалось сохранить протокол'; return 1;
+  }
+ else
+ uci set "zapret2_home.main.clients=$C" && uci set "zapret2_home.main.destinations=$D" &&
+  uci set "zapret2_home.main.client_mode=$M" && uci set "zapret2_home.main.lists=$LS" &&
+  uci set "zapret2_home.main.auto_update=$AU" && uci set "zapret2_home.main.profile=$PF" &&
+  uci set "zapret2_home.main.tcp_enabled=$TE" && uci set "zapret2_home.main.quic_enabled=$QE" &&
+  uci set "zapret2_home.main.quic_profile=$QPF" && uci set "zapret2_home.main.udp_enabled=$UE" &&
+  uci set "zapret2_home.main.udp_profile=$UPF" && uci commit zapret2_home || {
+   configure_failed 'Не удалось сохранить настройки'; return 1;
+  }
+ fi
+ set_autostart "$A" >>"$RUN/action.log" 2>&1 || { configure_failed 'Не удалось изменить автозапуск'; return 1; }
+ if [ "$CFG_WAS_RUNNING" = 1 ]; then
+  # The fixed init action performs full cache/nft/engine preflight. WAN-pending
+  # or init success alone is not successful active configuration.
+  if ! "$SVC" start >>"$RUN/action.log" 2>&1 || ! confirm_start "$CFG_OLD_GENERATION"; then
+   configure_failed 'Новые настройки сохранены, но запуск не подтверждён'; return 1
+  fi
+ fi
+ configuration_unchanged || { configure_failed 'Сохранённые настройки не совпадают с запросом'; return 1; }
+ if [ "$CFG_WAS_RUNNING" = 0 ]; then
+  if is_running || worker_alive || nft list table inet "$TABLE" >/dev/null 2>&1 || [ -f "$RUN/requested" ]; then
+   configure_failed 'Неактивная служба неожиданно запущена'; return 1
+  fi
+ fi
+ CFG_ARMED=0
+ rm -rf "$CFG_BACKUP"
+ ok
+}
+configure_job_alive() {
+ [ -f "$RUN/configure.job" ] || return 1
+ read -r CONFIG_JOB_ID <"$RUN/configure.job"
+ case "$CONFIG_JOB_ID" in ''|*[!0-9]*) return 1;; esac
+ read -r CONFIG_JOB_PID <"$RUN/configure-job.$CONFIG_JOB_ID/pid" 2>/dev/null
+ case "$CONFIG_JOB_PID" in ''|*[!0-9]*) return 1;; esac
+ kill -0 "$CONFIG_JOB_PID" 2>/dev/null || return 1
+ tr '\000' '\n' <"/proc/$CONFIG_JOB_PID/cmdline" 2>/dev/null | grep -Fx /usr/libexec/zapret2-home-ctl >/dev/null &&
+  tr '\000' '\n' <"/proc/$CONFIG_JOB_PID/cmdline" 2>/dev/null | grep -Fx configure-run >/dev/null &&
+  tr '\000' '\n' <"/proc/$CONFIG_JOB_PID/cmdline" 2>/dev/null | grep -Fx "$CONFIG_JOB_ID" >/dev/null
+}
+configure_job_exit() {
+ trap '' HUP INT TERM
+ trap - EXIT
+ if [ "$CFG_ARMED" = 1 ]; then
+  configure_failed 'Сохранение прервано; выполнено восстановление' >"$CFG_JOB/result.tmp"
+ elif [ ! -s "$CFG_JOB/result.tmp" ]; then
+  configure_error 'Операция сохранения прервана; проверьте фактическое состояние' 0 >"$CFG_JOB/result.tmp"
+ fi
+ # Publish atomically both to the original caller and to status polling. The
+ # marker remains after a hard kill so status can report recovery-required.
+ if ucode -e 'import { readfile } from "fs"; let s=json(readfile(ARGV[0])); s.job_id=ARGV[1]; print(sprintf("%J\n",s));' "$CFG_JOB/result.tmp" "$CFG_JOB_ID" >"$CFG_JOB/result.new"; then
+  mv -f "$CFG_JOB/result.new" "$CFG_JOB/result"
+  cp "$CFG_JOB/result" "$RUN/configure-result.tmp.$$" && mv -f "$RUN/configure-result.tmp.$$" "$RUN/configure-result.json"
+ fi
+ unlock_all
+}
+configure_job_run() {
+ case "$1" in ''|*[!0-9]*) return 1;; esac
+ CFG_JOB_ID="$1"; CFG_JOB="$RUN/configure-job.$CFG_JOB_ID"
+ [ -f "$CFG_JOB/request" ] || return 1
+ CFG_BRANCH=''; [ ! -f "$CFG_JOB/branch" ] || read -r CFG_BRANCH <"$CFG_JOB/branch" || return 1
+ case "$CFG_BRANCH" in ''|tcp|quic|udp) ;; *) return 1;; esac
+ # Compare owner and hand off under the shared admission guard.
+ lock_state handoff control "$CFG_JOB_ID" "$2" || return 1
+ LOCKS=control; CFG_ARMED=0
+ trap configure_job_exit EXIT
+ trap 'exit 1' HUP INT TERM
+ printf '%s\n' "$$" >"$CFG_JOB/pid"
+ touch "$CFG_JOB/ack"
+ configure_transaction <"$CFG_JOB/request" >"$CFG_JOB/result.tmp"
+ return "$?"
+}
+profiles_idle() {
+ # Acquisition uses control.lock before this same diagnostic guard.
+ ucode -e '
+  import { open, readfile, stat } from "fs";
+  let run=ARGV[0]; if(!stat(run)) exit(0);
+  let guard=open(run+"/guard","a"); if(!guard || !guard.lock("x")) exit(1);
+  function state(name) {
+   if(!stat(run+"/"+name)) return null;
+   let f=open(run+"/"+name,"r"), raw=f && f.read(262145), x;
+   if(!raw || length(raw)>262144 || index(raw,"\u0000")>=0) exit(1);
+   try { x=json(raw); } catch(e) { exit(1); }
+   if(type(x)!="object") exit(1); return x;
+  }
+  let owner=state("owner"), finishing=state("finishing"), result=state("result");
+  if(owner) exit(1);
+  if(finishing) {
+   if(!match(finishing.pid || "",/^[1-9][0-9]*$/) || !match(finishing.ticks || "",/^[0-9]+$/)) exit(1);
+   let raw=readfile("/proc/"+finishing.pid+"/stat") || "", at=rindex(raw,") "), f=split(substr(raw,at+2)," ");
+   if(at>=0 && f[0]!="Z" && f[19]==finishing.ticks) exit(1);
+  }
+  if(result && index(["idle","results","error"],result.state)<0) exit(1);
+ ' "$RUN/profiles"
+}
+configure() {
+ lock_op control || { configure_error 'Другая операция управления выполняется' 0; return 1; }
+ # Invalid requests never launch a worker or touch service/settings/intent.
+ CFG_REQUEST=$(ucode "$LIB/validate.uc" "$1") || {
+  json_load "$CFG_REQUEST"; json_get_var CFG_VALIDATION_ERROR error
+  configure_error "${CFG_VALIDATION_ERROR:-Некорректный запрос настроек}" 0; return 1;
+ }
+ CFG_BRANCH=''
+ if [ "$1" = protocol ]; then json_load "$CFG_REQUEST"; json_get_var CFG_BRANCH protocol; fi
+ validated_cfg >/dev/null 2>&1 || { configure_error 'Текущие настройки некорректны' 0; return 1; }
+ A=0; "$SVC" enabled && A=1
+ json_init; json_add_string clients "$C"; json_add_string destinations "$D"; json_add_boolean autostart "$A"
+ json_add_string client_mode "$M"; json_add_string lists "$LS"; json_add_boolean auto_update "$AU"; json_add_string profile "$PF"; add_protocols
+ CFG_SAVED=$(json_dump)
+ CFG_REQUEST=$(printf '%s\n' "$CFG_REQUEST" | ucode -e '
+  import { readfile } from "fs";
+  let request=json(readfile("/dev/stdin")), saved=json(ARGV[0]), mode=ARGV[1];
+  delete request.ok;
+  if(mode=="protocol") {
+   saved[request.protocol+"_enabled"]=request.enabled;
+   saved[request.protocol=="tcp"?"profile":request.protocol+"_profile"]=request.profile;
+   request=saved;
+  } else if(mode=="profile") { saved.profile=request.profile; request=saved; }
+  else for(let key in ["profile","tcp_enabled","quic_enabled","quic_profile","udp_enabled","udp_profile"]) if(!(key in request)) request[key]=saved[key];
+  print(sprintf("%J\n",request));' "$CFG_SAVED" "$1") || { configure_error 'Не удалось подготовить запрос сохранения' 0; return 1; }
+ CFG_REQUEST=$(printf '%s\n' "$CFG_REQUEST" | ucode "$LIB/validate.uc") || {
+  json_load "$CFG_REQUEST"; json_get_var CFG_VALIDATION_ERROR error
+  configure_error "${CFG_VALIDATION_ERROR:-Некорректный запрос настроек}" 0; return 1;
+ }
+ CFG_REQUEST=$(printf '%s\n' "$CFG_REQUEST" | ucode -e 'import { readfile } from "fs"; let x=json(readfile("/dev/stdin")); delete x.ok; print(sprintf("%J\n",x));') || return 1
+ profiles_idle || { configure_error 'Диагностика выполняется, очищается или её состояние неизвестно' 0; return 1; }
+ # Profile apply rejects an updater even for identical profile; legacy scope no-op remains safe.
+ if [ "$1" = profile ] || [ "$1" = protocol ]; then
+  /usr/libexec/zapret2-home-lists ensure-idle || { configure_error 'Дождитесь завершения обновления списков' 0; return 1; }
+ fi
+ if [ -f "$RUN/configure.job" ]; then
+  read -r PREVIOUS_JOB <"$RUN/configure.job"
+  case "$PREVIOUS_JOB" in ''|*[!0-9]*) configure_error 'Повреждён маркер сохранения; требуется проверка восстановления' 0; return 1;; esac
+  [ -f "$RUN/configure-job.$PREVIOUS_JOB/result" ] || {
+   configure_error 'Предыдущее сохранение завершилось без результата; требуется проверка восстановления' 0; return 1;
+  }
+  ucode -e 'import { readfile } from "fs"; let s=json(readfile(ARGV[0])); exit(type(s)=="object" && type(s.ok)=="bool" && !s.recovery_required?0:1);' "$RUN/configure-job.$PREVIOUS_JOB/result" || {
+   configure_error 'Предыдущее сохранение требует восстановления' 0; return 1;
+  }
+  rm -rf "$RUN/configure-job.$PREVIOUS_JOB"
+ fi
+ CFG_JOB_ID="$$"; CFG_JOB="$RUN/configure-job.$CFG_JOB_ID"
+ mkdir -m 700 "$CFG_JOB" || { configure_error 'Не удалось создать задание сохранения' 0; return 1; }
+ printf '%s\n' "$CFG_REQUEST" >"$CFG_JOB/request" || { rm -rf "$CFG_JOB"; configure_error 'Не удалось сохранить запрос' 0; return 1; }
+ printf '%s\n' "$CFG_BRANCH" >"$CFG_JOB/branch" || { rm -rf "$CFG_JOB"; configure_error 'Не удалось сохранить ветвь протокола' 0; return 1; }
+ printf '%s\n' "$CFG_JOB_ID" >"$RUN/configure.job"
+ read -r CFG_PARENT_TICKS <"$RUN/control.lock/ticks" || return 1
+ /usr/libexec/zapret2-home-ctl configure-run "$CFG_JOB_ID" "$CFG_PARENT_TICKS" </dev/null >"$CFG_JOB/job.log" 2>&1 &
+ CFG_CHILD=$!
+ # Bounded RPC path: at most 10s lock contention + 3s handoff + 8s result
+ # waiting. Actual prepare/start/rollback stays in the detached locked job.
+ for n in 1 2 3; do [ -f "$CFG_JOB/ack" ] && break; kill -0 "$CFG_CHILD" 2>/dev/null || break; sleep 1; done
+ if [ ! -f "$CFG_JOB/ack" ]; then
+  # Do not kill a possibly-starting child: its exact-target status is the
+  # authoritative result. No success is claimed by a missing acknowledgement.
+  configure_error 'Запуск задания не подтверждён; проверьте состояние сохранения' 0; return 1
+ fi
+ for n in 1 2 3 4 5 6 7 8; do
+  if [ -f "$CFG_JOB/result" ]; then
+   cat "$CFG_JOB/result"
+   json_load "$(cat "$CFG_JOB/result")"; json_get_var CFG_RESULT_OK ok
+   [ "$CFG_RESULT_OK" = 1 ]; return "$?"
+  fi
+  sleep 1
+ done
+ json_init; json_add_boolean ok 1; json_add_boolean pending 1
+ json_add_string job_id "$CFG_JOB_ID"; json_dump; printf '\n'
+}
+control() {
+ ACTION=$(dd bs=32 count=1 2>/dev/null)
+ lock_op control || { err 'Другая операция управления выполняется'; return 1; }
+ case "$ACTION" in
+ start|restart)
+  "$SVC" "$ACTION" >"$RUN/action.log" 2>&1 || { err 'Служба не запустилась — см. журнал'; return 1; }
+  if ! wan && [ -f "$RUN/requested" ]; then json_init; json_add_boolean ok 1; json_add_boolean pending 1; json_dump; return 0; fi
+  # Large approved subnet sets take several seconds to commit on embedded CPUs.
+  # Keep the confirmation bounded, but do not stop a healthy worker after only 5s.
+  for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do is_running && nft list table inet "$TABLE" >/dev/null 2>&1 && { ok; return; }; sleep 1; done
+  "$SVC" stop >"$RUN/action.log" 2>&1; remove; err 'Не удалось подтвердить запуск'; return 1 ;;
+ stop) "$SVC" stop >"$RUN/action.log" 2>&1; if quiesce; then ok; else err 'Не удалось подтвердить остановку процесса и удаление правил'; return 1; fi ;;
+ enable) "$SVC" enable && "$SVC" enabled && ok || { err 'Автозапуск не включён'; return 1; } ;;
+ disable) "$SVC" disable && { if "$SVC" enabled; then err 'Автозапуск остался включён'; return 1; else ok; fi; } ;;
+ *) err 'Недопустимое действие'; return 1 ;;
+ esac
+}
+case "$1" in
+ status) status ;;
+ lifecycle-check) lock_state restore-check && confirm_start ;;
+ configure) configure ;;
+ profiles-apply) configure profile ;;
+ protocols-apply) configure protocol ;;
+ configure-run) configure_job_run "$2" "$3" ;;
+ update_lists) if lock_op control; then /usr/libexec/zapret2-home-lists update; else err 'Другая операция управления выполняется'; fi ;;
+ reconcile-running) if is_running; then apply; fi ;;
+ control) control ;;
+ logs) json_init; json_add_string log "$(logread -e zapret2-home | tail -n 60; if [ -f "$RUN/action.log" ]; then printf '\nПоследняя операция:\n'; dd if="$RUN/action.log" bs=4096 count=1 2>/dev/null; fi)"; json_dump; printf '\n' ;;
+ check) if prepare >"$RUN/check.log" 2>&1; then json_init; json_add_boolean ok 1; json_add_string details 'Хэши, Lua dry-run, область обработки и nft -c проверены. Это не тест интернет-доступа.'; json_dump; printf '\n'; else json_init; json_add_boolean ok 0; json_add_string details "$(dd if="$RUN/check.log" bs=4096 count=1 2>/dev/null)"; json_dump; printf '\n'; fi ;;
+ prepare) prepare ;;
+ apply) apply "$2" ;;
+ remove) remove "$2" ;;
+ quiesce) quiesce ;;
+ request) request_start ;;
+ running) is_running ;;
+ wan-ready) wan ;;
+ reconcile) if is_running; then apply; elif [ -f "$RUN/requested" ] && [ ! -f "$RUN/stopping" ]; then "$SVC" start; fi ;;
+ *) err 'Недопустимое действие'; exit 1 ;;
+esac

@@ -1,0 +1,59 @@
+[
+  {
+    "id": "alt1",
+    "title": "hostfakesplit alt1",
+    "evidence": "previously_verified",
+    "strategy": "hostfakesplit_alt1:host=ya.ru:midhost=midsld:tcp_ack=-66000:tcp_ts_up",
+    "args": [
+      "--lua-desync=hostfakesplit_alt1:host=ya.ru:midhost=midsld:tcp_ack=-66000:tcp_ts_up"
+    ]
+  },
+  {
+    "id": "stock",
+    "title": "hostfakesplit stock",
+    "evidence": "experimental",
+    "strategy": "hostfakesplit:host=ya.ru:midhost=midsld:tcp_ack=-66000:tcp_ts_up",
+    "args": [
+      "--lua-desync=hostfakesplit:host=ya.ru:midhost=midsld:tcp_ack=-66000:tcp_ts_up"
+    ]
+  },
+  {
+    "id": "overlap",
+    "title": "TLS overlap",
+    "evidence": "experimental",
+    "strategy": "multisplit:pos=1:seqovl=681:seqovl_pattern=fake_default_tls",
+    "args": [
+      "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fake_default_tls"
+    ]
+  },
+  {
+    "id": "fake",
+    "title": "Fake TLS",
+    "evidence": "experimental",
+    "strategy": "fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=ya.ru:tcp_ack=-66000:tcp_ts_up:repeats=6",
+    "args": [
+      "--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=ya.ru:tcp_ack=-66000:tcp_ts_up:repeats=6"
+    ]
+  },
+  {
+    "id": "fake_split",
+    "title": "Fake TLS badsum + split",
+    "evidence": "experimental",
+    "strategy": "fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=ya.ru:badsum:repeats=10 → multisplit:pos=1,midsld",
+    "args": [
+      "--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=ya.ru:badsum:repeats=10",
+      "--lua-desync=multisplit:pos=1,midsld"
+    ]
+  },
+  {
+    "id": "fake_disorder",
+    "title": "Fake TLS + disorder",
+    "evidence": "experimental",
+    "strategy": "fake:blob=0x00000000:tcp_ack=-66000:tcp_ts_up:repeats=6 → fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:tcp_ack=-66000:tcp_ts_up:repeats=6 → multidisorder_legacy:pos=1,midsld",
+    "args": [
+      "--lua-desync=fake:blob=0x00000000:tcp_ack=-66000:tcp_ts_up:repeats=6",
+      "--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:tcp_ack=-66000:tcp_ts_up:repeats=6",
+      "--lua-desync=multidisorder_legacy:pos=1,midsld"
+    ]
+  }
+]

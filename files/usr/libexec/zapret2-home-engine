@@ -1,0 +1,29 @@
+#!/bin/sh
+# Trusted fixed helper tokens become argv only; never shell source.
+LIB=/usr/lib/zapret2-home
+QUEUE=$1; PROFILE=$2; MODE=$3
+case "$#:$PROFILE" in
+ 3:main)
+  TE=$(uci -q get zapret2_home.main.tcp_enabled) || TE=1
+  PF=$(uci -q get zapret2_home.main.profile) || PF=alt1
+  QE=$(uci -q get zapret2_home.main.quic_enabled) || QE=0
+  QPF=$(uci -q get zapret2_home.main.quic_profile) || QPF=quic_google
+  UE=$(uci -q get zapret2_home.main.udp_enabled) || UE=0
+  UPF=$(uci -q get zapret2_home.main.udp_profile) || UPF=udp_fake2
+  ARGS=$(ucode "$LIB/protocols.uc" main-argv "$QUEUE" "$MODE" "$TE" "$PF" "$QE" "$QPF" "$UE" "$UPF") || exit 1 ;;
+ 9:main)
+  shift 3
+  ARGS=$(ucode "$LIB/protocols.uc" main-argv "$QUEUE" "$MODE" "$@") || exit 1 ;;
+ 3:*) ARGS=$(ucode "$LIB/protocols.uc" argv "$QUEUE" "$PROFILE" "$MODE" tcp) || exit 1 ;;
+ 4:*) ARGS=$(ucode "$LIB/protocols.uc" argv "$QUEUE" "$PROFILE" "$MODE" "$4") || exit 1 ;;
+ *) exit 1 ;;
+esac
+# The main production engine cannot consume the isolated diagnostic queue.
+[ "$PROFILE" != main ] || [ "$QUEUE" = 213 ] || exit 1
+set --
+set -f
+IFS='
+'
+for ARG in $ARGS; do set -- "$@" "$ARG"; done
+[ "$#" -gt 0 ] || exit 1
+exec "$@"

@@ -1,0 +1,316 @@
+#!/bin/sh
+# Admission-ABI: 1
+# Fixed root-only isolated diagnostic. No main-service/UCI mutations.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+set -f
+LIB=/usr/lib/zapret2-home
+RUN=/var/run/zapret2-home/profiles
+SELF=/usr/libexec/zapret2-home-profiles
+LAUNCHER=/usr/libexec/zapret2-home-engine
+CONTROL=/var/run/zapret2-home/control.lock
+CONTROL_HELD=0
+PROC=/proc
+UC="$LIB/profiles.uc"
+JOB=''; BASE=''; ENGINE=''; CURL=''; WATCH=''; SLEEP=''; WORKER=0; WATCHDOG=0; FINISHED=0
+u() { ucode "$UC" "$@"; }
+health_check() {
+ local SNAPSHOT RC
+ SNAPSHOT=$(u health 2>/dev/null); RC=$?
+ [ "$RC" = 0 ] && return 0
+ case "$RC" in 2|3) ;; *) RC=1;; esac
+ # Keep the triggering numbers in the retained result before child/table cleanup.
+ u health-error "$JOB" "$1" "$RC" "$SNAPSHOT" >/dev/null
+ return 1
+}
+error() { printf '{"ok":false,"error":"%s"}\n' "$1"; return 1; }
+[ ! -L "$RUN" ] || exit 1
+http3() {
+ "$LIB/curl-http3" --version 2>/dev/null | while IFS= read -r LINE; do
+  case "$LINE" in Features:*) for WORD in $LINE; do [ "$WORD" = HTTP3 ] && { printf HTTP3; exit 0; }; done;; esac
+ done
+}
+remember_child() {
+ local NAME=$1 PID=$2 TICKS RC
+ WAITED_PID=''
+ TICKS=$(u identity "$PID" "$$" 2>/dev/null) || TICKS=''
+ if u remember "$JOB" "$NAME" "$PID" >/dev/null; then
+  rm -f "$BASE/$NAME-unregistered"
+  return $?
+ fi
+ if u child-ended "$PID" "$$" >/dev/null 2>&1; then
+  wait "$PID" 2>/dev/null; RC=$?
+  [ "$RC" != 127 ] || return 1
+  WAITED_PID=$PID WAITED_RC=$RC
+  rm -f "$BASE/$NAME-unregistered"
+  return $?
+ fi
+ # The intent predates spawn: a trap or uncertain stop must retain recovery scope.
+ if [ -n "$TICKS" ]; then
+  if [ "$(u identity "$PID" "$$" 2>/dev/null)" = "$TICKS" ]; then
+   kill -TERM "$PID" 2>/dev/null || return 1
+   for RC in 1 2 3; do
+    [ "$(u identity "$PID" "$$" 2>/dev/null)" = "$TICKS" ] || break
+    sleep 1
+   done
+   if [ "$(u identity "$PID" "$$" 2>/dev/null)" = "$TICKS" ]; then
+    kill -KILL "$PID" 2>/dev/null || return 1
+   fi
+  fi
+ elif kill -0 "$PID" 2>/dev/null; then
+  return 1
+ fi
+ # Only our newly spawned, still-waitable child; never a PID from a stale record.
+ wait "$PID" 2>/dev/null; RC=$?
+ [ "$RC" != 127 ] && rm -f "$BASE/$NAME-unregistered"
+ return 1
+}
+wait_child() {
+ # BusyBox can forget a reaped child's status after intervening foreground commands.
+ if [ "${WAITED_PID:-}" = "$1" ]; then return "$WAITED_RC"; fi
+ wait "$1"
+}
+sleep_owned() {
+ sleep "$1" & SLEEP=$!
+ SLEEP_NAME=worker-sleep; [ "$WATCHDOG" = 1 ] && SLEEP_NAME=watchdog-sleep
+ u remember "$JOB" "$SLEEP_NAME" "$SLEEP" >/dev/null || { kill "$SLEEP" 2>/dev/null; wait "$SLEEP" 2>/dev/null; SLEEP=''; return 1; }
+ wait "$SLEEP"; RC=$?; SLEEP=''; return "$RC"
+}
+stop_child() {
+ NAME=$1
+ PID=$(u child-pid "$JOB" "$NAME" 2>/dev/null) || return 0
+ kill -TERM "$PID" 2>/dev/null
+ # These fixed children have no descendants (curl/engine exec, watchdog reaps sleep).
+ for N in 1 2 3; do u child-alive "$JOB" "$NAME" >/dev/null 2>&1 || break; sleep 1; done
+ if u child-alive "$JOB" "$NAME" >/dev/null 2>&1; then kill -KILL "$PID" 2>/dev/null; fi
+ wait "$PID" 2>/dev/null
+ ! u child-alive "$JOB" "$NAME" >/dev/null 2>&1
+}
+remove_table() {
+ [ -f "$BASE/table-intent" ] || return 0
+ nft -j list tables >"$BASE/table.json" 2>/dev/null || return 1
+ u has-table "$JOB" >/dev/null 2>&1; TABLE_RC=$?
+ case "$TABLE_RC" in 0) ;; 3) return 0;; *) return 1;; esac
+ nft -j list table inet zapret2_home_profiles >"$BASE/table.json" 2>/dev/null && u table-owned "$JOB" >/dev/null || return 1
+ nft delete table inet zapret2_home_profiles >/dev/null 2>&1 || return 1
+ nft -j list tables >"$BASE/table.json" 2>/dev/null || return 1
+ u has-table "$JOB" >/dev/null 2>&1; [ "$?" = 3 ]
+}
+resources() {
+ u cleanup-claim "$JOB" "$$" >/dev/null 2>&1 || return 0
+ GOOD=1
+ stop_child curl || GOOD=0
+ stop_child engine || GOOD=0
+ for INTENT in engine curl watchdog; do [ ! -e "$BASE/$INTENT-unregistered" ] || GOOD=0; done
+ if [ "$GOOD" = 1 ]; then remove_table || GOOD=0; fi
+ if [ "$GOOD" != 1 ]; then
+  u state "$JOB" error 'Cleanup failed; scope retained, manual recovery required' >/dev/null
+  return 1
+ fi
+ u release "$JOB" "$$" >/dev/null || return 1
+ # Only the generation directory we created; compact last result is retained.
+ rm -rf "$BASE"
+}
+release_control() {
+ [ "$CONTROL_HELD" = 1 ] || return 0
+ ucode "$LIB/lock.uc" release control "$$" || return 1
+ CONTROL_HELD=0
+}
+cleanup() {
+ trap - EXIT HUP INT TERM
+ release_control
+ if [ -n "$SLEEP" ]; then
+  u child-alive "$JOB" "$SLEEP_NAME" >/dev/null 2>&1 && kill "$SLEEP" 2>/dev/null
+  wait "$SLEEP" 2>/dev/null
+ fi
+ if [ "$WORKER" = 1 ]; then
+  [ "$FINISHED" = 1 ] || u interrupted "$JOB" error 'Diagnostic interrupted or setup failed' >/dev/null
+  resources; CLEANED=$?
+  [ "$CLEANED" = 0 ] && [ -n "$WATCH" ] && wait "$WATCH" 2>/dev/null
+ elif [ "$WATCHDOG" = 1 ]; then
+  if ! u owner-alive "$JOB" >/dev/null 2>&1; then
+   u state "$JOB" error 'Diagnostic worker lost; watchdog cleanup' >/dev/null
+   resources
+  fi
+ elif [ -n "$JOB" ] && u is-owner "$JOB" "$$" >/dev/null 2>&1; then
+  resources
+ fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+failed() { u state "$JOB" error "$1" >/dev/null; FINISHED=1; return 1; }
+queue_present() {
+ [ -r "$PROC/net/netfilter/nfnetlink_queue" ] || return 1
+ while read -r Q REST; do [ "$Q" = 214 ] && return 0; done <"$PROC/net/netfilter/nfnetlink_queue"
+ return 1
+}
+launch_engine() {
+ : >"$BASE/engine-unregistered" || return 1
+ (ulimit -f 64 || exit 1
+  if [ "$PROTOCOL" = tcp ]; then exec nice -n 19 "$LAUNCHER" 214 "$ENGINE_PROFILE" "$1";
+  else exec nice -n 19 "$LAUNCHER" 214 "$ENGINE_PROFILE" "$1" "$PROTOCOL"; fi) >"$BASE/engine.log" 2>&1 &
+ ENGINE=$!
+ remember_child engine "$ENGINE"
+}
+start_engine() {
+ stop_child engine || return 1
+ queue_present && return 1
+ ENGINE_PROFILE=$1
+ launch_engine dry-run || return 1
+ wait_child "$ENGINE"; RC=$?
+ [ "$RC" = 0 ] || return 1
+ # Both dry-run and real engine exec as the recorded/waitable PID.
+ launch_engine run || return 1
+ for N in 1 2 3 4 5; do
+  u child-alive "$JOB" engine >/dev/null || return 1
+  queue_present && return 0
+  sleep_owned 1 || return 1
+ done
+ return 1
+}
+watchdog() {
+ u is-owner "$JOB" "$1" >/dev/null || return 1
+ WATCHDOG=1
+ # Parent records our start time before allowing any nft/engine writes.
+ for N in 1 2 3; do
+  [ "$(u child-pid "$JOB" watchdog 2>/dev/null)" = "$$" ] && break
+  sleep_owned 1 || return 1
+ done
+ [ "$(u child-pid "$JOB" watchdog 2>/dev/null)" = "$$" ] || return 1
+ printf 'ready\n' >"$BASE/watch-ready"
+ N=0
+ while u owner-alive "$JOB" >/dev/null 2>&1; do
+  WATCH_ERROR=''
+  if ! u deadline "$JOB" >/dev/null 2>&1; then
+   WATCH_ERROR='Истёк лимит времени диагностики (1350 с)'
+  elif ! health_check watchdog; then
+   WATCH_ERROR=recorded
+  fi
+  if [ -n "$WATCH_ERROR" ]; then
+   [ "$WATCH_ERROR" = recorded ] || u state "$JOB" error "$WATCH_ERROR" >/dev/null
+   PID=$(u owner-pid "$JOB") || break
+   kill -TERM "$PID" 2>/dev/null
+   sleep_owned 5
+   u owner-alive "$JOB" >/dev/null 2>&1 && kill -KILL "$PID" 2>/dev/null
+   break
+  fi
+  sleep_owned 1 || return 1
+  N=$((N+1))
+ done
+}
+run_test() {
+ u handoff "$JOB" "$$" "$1" >/dev/null || return 1
+ WORKER=1
+ u state "$JOB" running '' >/dev/null || return 1
+ : >"$BASE/watchdog-unregistered" || return 1
+ "$SELF" test-run --watchdog "$JOB" "$$" </dev/null >/dev/null 2>&1 & WATCH=$!
+ remember_child watchdog "$WATCH" || return 1
+ for N in 1 2 3; do [ -f "$BASE/watch-ready" ] && break; sleep_owned 1 || return 1; done
+ [ -f "$BASE/watch-ready" ] || { failed 'Watchdog did not acknowledge'; return 1; }
+ printf '%s\n' "$JOB" >"$RUN/ack"
+ read -r PROFILES <"$BASE/profiles"
+ read -r TARGETS <"$BASE/targets"
+ read -r REPEAT <"$BASE/repeat"
+ read -r PROTOCOL <"$BASE/protocol"
+ [ "$PROTOCOL" != quic ] || [ "$(http3)" = HTTP3 ] || { failed 'curl HTTP3 support disappeared; no TCP fallback'; return 1; }
+ (cd "$LIB" && sha256sum -c SHA256SUMS >/dev/null 2>&1) || { failed 'Diagnostic runtime integrity failed'; return 1; }
+ health_check worker || return 1
+ (ulimit -f 256; nft -t list ruleset) >"$BASE/ruleset" 2>/dev/null && u preflight "$JOB" "$PROTOCOL" >"$BASE/preflight.json" || { failed 'Preflight UID, queue, ports or nft scope conflict'; return 1; }
+ rm -f "$BASE/ruleset"
+ u rules "$JOB" "$PROTOCOL" >"$BASE/rules.nft" && nft -c -f "$BASE/rules.nft" >"$BASE/nft.log" 2>&1 || { failed 'Diagnostic nft syntax check failed'; return 1; }
+ # Watchdog already owns cleanup before the first external state mutation.
+ : >"$BASE/table-intent"
+ nft -f "$BASE/rules.nft" >"$BASE/nft.log" 2>&1 && nft -j list table inet zapret2_home_profiles >"$BASE/table.json" 2>/dev/null && u table-owned "$JOB" >/dev/null || { failed 'Diagnostic nft apply or readback failed'; return 1; }
+ PORT=12600
+ for PROFILE in $PROFILES; do
+  start_engine "$PROFILE" || { failed 'Diagnostic engine or queue setup failed'; return 1; }
+  for TARGET in $TARGETS; do
+   INFO=$(u target "$TARGET" "$PROTOCOL") || return 1
+   { read -r HOST; read -r IP; read -r URL; } <<EOF
+$INFO
+EOF
+   R=1
+   while [ "$R" -le "$REPEAT" ]; do
+    health_check worker || return 1
+    u child-alive "$JOB" engine >/dev/null && queue_present || { failed 'Isolated engine or queue lost'; return 1; }
+    : >"$BASE/curl-unregistered" || return 1
+    if [ "$PROTOCOL" = udp ]; then
+     (ulimit -f 64 || exit 1; exec nice -n 19 start-stop-daemon -S -p "$BASE/curl.launch" -x "$LIB/stun-probe" -c 1 -- "$PORT") >"$BASE/metrics" 2>"$BASE/curl.log" &
+    else
+    # UID 1 writes only this single precreated body; credentials and headers are never stored.
+    : >"$BASE/body"; chmod 600 "$BASE/body"; chown 1 "$BASE/body" || return 1
+    HTTP_FLAG=--http2; HTTP_CLIENT=/usr/bin/curl
+    if [ "$PROTOCOL" = quic ]; then HTTP_FLAG=--http3-only; HTTP_CLIENT="$LIB/curl-http3"; fi
+    (ulimit -f 2048 || exit 1; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; exec nice -n 19 start-stop-daemon -S -p "$BASE/curl.launch" -x "$HTTP_CLIENT" -c 1 -- \
+     -q -4 --proxy '' --noproxy '*' --proto '=https' --tlsv1.2 --cacert /etc/ssl/certs/ca-certificates.crt --silent --show-error \
+     "$HTTP_FLAG" --user-agent 'Mozilla/5.0' --header 'Accept-Encoding: identity' --connect-timeout 5 --max-time 20 \
+     --limit-rate 64K --max-filesize 2097152 --local-port "$PORT" --resolve "$HOST:443:$IP" \
+     --output /proc/self/fd/3 --write-out '{"http_code":"%{http_code}","size_download":"%{size_download}","remote_ip":"%{remote_ip}","local_ip":"%{local_ip}","local_port":"%{local_port}","time_total":"%{time_total}","time_connect":"%{time_connect}","time_appconnect":"%{time_appconnect}","ssl_verify_result":"%{ssl_verify_result}","http_version":"%{http_version}"}' "$URL") >"$BASE/metrics" 2>"$BASE/curl.log" 3>"$BASE/body" &
+    fi
+    CURL=$!
+    remember_child curl "$CURL" || return 1
+    wait_child "$CURL"; RC=$?; CURL=''
+    HASH=0000000000000000000000000000000000000000000000000000000000000000; BYTES=0
+    if [ "$PROTOCOL" != udp ]; then HASH=$(sha256sum "$BASE/body"); HASH=${HASH%% *}; BYTES=$(wc -c <"$BASE/body"); fi
+    u row "$JOB" "$PROFILE" "$TARGET" "$R" "$RC" "$HASH" "$BYTES" "$PORT" >/dev/null
+    ROW_RC=$?
+    rm -f "$BASE/body" "$BASE/curl.log"
+    [ "$ROW_RC" = 0 ] || { failed 'Response tuple mismatch or invalid result; batch stopped'; return 1; }
+    PORT=$((PORT+1)); R=$((R+1))
+   done
+  done
+ done
+ u state "$JOB" results '' >/dev/null || return 1
+ FINISHED=1
+}
+launch() {
+ PROTOCOL=tcp
+ if [ "$1" = protocols-test ]; then INPUT=$(u validate-protocol "$(http3)"); else INPUT=$(u validate); fi
+ RC=$?; [ "$RC" = 0 ] || { printf '%s\n' "$INPUT"; return 1; }
+ { read -r PROFILES; read -r TARGETS; read -r REPEAT; read -r SELECTED_PROTOCOL; } <<EOF
+$INPUT
+EOF
+ [ -z "$SELECTED_PROTOCOL" ] || PROTOCOL=$SELECTED_PROTOCOL
+ [ "$PROTOCOL" != udp ] || [ -x "$LIB/stun-probe" ] || { error 'Native STUN probe unavailable'; return 1; }
+ [ ! -L "$RUN" ] && mkdir -p "$RUN" && chmod 700 "$RUN" || return 1
+ # Publish the diagnostic owner while holding the same guard as profile apply.
+ ucode "$LIB/lock.uc" acquire control "$$" || { error 'Main control busy or frozen; diagnostic not launched'; return 1; }
+ CONTROL_HELD=1
+ JOB=$(u acquire "$$" "$PROTOCOL") || { printf '%s\n' "$JOB"; JOB=''; release_control; return 1; }
+ release_control
+ BASE="$RUN/$JOB"
+
+ printf '%s\n' "$PROFILES" >"$BASE/profiles"
+ printf '%s\n' "$TARGETS" >"$BASE/targets"
+ printf '%s\n' "$REPEAT" >"$BASE/repeat"
+ printf '%s\n' "$PROTOCOL" >"$BASE/protocol"
+ u plan "$JOB" "$PROTOCOL" "$PROFILES" "$TARGETS" "$REPEAT" >/dev/null || return 1
+ start-stop-daemon -S -b -x "$SELF" -- test-run "$JOB" "$$" >/dev/null 2>&1 || { error 'Cannot detach diagnostic'; return 1; }
+ for N in 1 2 3 4; do
+  if [ -f "$RUN/ack" ]; then
+   read -r ACK <"$RUN/ack"
+   [ "$ACK" = "$JOB" ] && { printf '{"ok":true,"pending":true,"job_id":"%s"}\n' "$JOB"; return 0; }
+  fi
+  sleep 1
+ done
+ PID=$(u owner-pid "$JOB" 2>/dev/null) || PID=''
+ [ -n "$PID" ] && [ "$PID" != "$$" ] && kill -TERM "$PID" 2>/dev/null
+ error 'Detached diagnostic did not acknowledge launch'
+}
+case "$1" in
+ catalog|status|protocols-status) [ "$#" = 1 ] || { error 'Invalid arguments'; exit 1; }; u validate-empty || exit 1; u "$1";;
+ protocols-catalog) [ "$#" = 1 ] || { error 'Invalid arguments'; exit 1; }; u validate-empty || exit 1; ucode "$LIB/protocols.uc" catalog | u protocols-catalog "$(http3)";;
+ test|protocols-test) [ "$#" = 1 ] || { error 'Invalid arguments'; exit 1; }; launch "$1";;
+ test-run)
+  case "$2" in
+   --watchdog) [ "$#" = 4 ] || exit 1; JOB=$3; PARENT=$4; MODE=watchdog;;
+   *) [ "$#" = 3 ] || exit 1; JOB=$2; PARENT=$3; MODE=worker;;
+  esac
+  case "$JOB" in ''|*[!0-9.]*|.*|*.) exit 1;; esac
+  case "$PARENT" in ''|*[!0-9]*) exit 1;; esac
+  BASE="$RUN/$JOB"
+  [ -d "$BASE" ] && [ ! -L "$BASE" ] || exit 1
+  if [ "$MODE" = watchdog ]; then watchdog "$PARENT"; else run_test "$PARENT"; fi;;
+ *) error 'Invalid profile operation';;
+esac

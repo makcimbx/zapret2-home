@@ -1,0 +1,17 @@
+/dist/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.log
+*.out
+*.ipk
+/tests/*.local-results.json
+/tests/*.backend-results.json
+/tests/*.remote-results.json
+/files/usr/lib/zapret2-home/nfqws2
+/files/usr/lib/zapret2-home/nfqws2-quic
+/files/usr/lib/zapret2-home/curl-http3
+/files/usr/lib/zapret2-home/stun-probe
+/files/usr/lib/zapret2-home/SHA256SUMS

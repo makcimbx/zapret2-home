@@ -1,0 +1,68 @@
+#!/bin/sh
+# Worker-owned daily timer. No cron, router-global configuration, or engine start.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+RUN=/var/run/zapret2-home
+CTL=/usr/libexec/zapret2-home-ctl
+LISTS=/usr/libexec/zapret2-home-lists
+WORKER=/usr/libexec/zapret2-home-worker
+. /usr/share/libubox/jshn.sh
+[ "$#" -le 1 ] || exit 1
+OWNER="$1"
+[ -n "$OWNER" ] || read -r OWNER <"$RUN/worker.pid" 2>/dev/null
+case "$OWNER" in ''|*[!0-9]*) exit 1;; esac
+SLEEP_PID=''; ACTION_PID=''
+cleanup() {
+ trap - EXIT INT TERM HUP
+ # Kill only our own waitable children, not the detached list updater.
+ [ -n "$SLEEP_PID" ] && { kill "$SLEEP_PID" 2>/dev/null; wait "$SLEEP_PID" 2>/dev/null; }
+ [ -n "$ACTION_PID" ] && { kill "$ACTION_PID" 2>/dev/null; wait "$ACTION_PID" 2>/dev/null; }
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+worker_alive() {
+ [ -f "$RUN/requested" ] && [ ! -f "$RUN/stopping" ] || return 1
+ read -r LIVE <"$RUN/worker.pid" 2>/dev/null
+ [ "$LIVE" = "$OWNER" ] && kill -0 "$OWNER" 2>/dev/null || return 1
+ tr '\000' '\n' <"/proc/$OWNER/cmdline" 2>/dev/null | grep -Fx "$WORKER" >/dev/null
+}
+maybe_update() {
+ AUTO=$(uci -q get zapret2_home.main.auto_update 2>/dev/null)
+ case "$AUTO" in 1|true|yes|on) :;; *) return 0;; esac
+ SELECTED=$(uci -q get zapret2_home.main.lists 2>/dev/null)
+ [ -n "$SELECTED" ] || return 0
+ "$CTL" running >/dev/null 2>&1 || return 0
+ STATUS=$("$LISTS" status) || return 0
+ json_load "$STATUS" || return 0
+ json_get_var ACTIVE update_running
+ [ "$ACTIVE" = 0 ] || return 0
+ json_select list_state || return 0
+ NOW=$(date +%s); DUE=0
+ set -f
+ for ID in $SELECTED; do
+  case "$ID" in flowseal|cloudflare|hetzner|cloudfront|ovh|digitalocean) :;; *) return 0;; esac
+  UPDATED=0
+  if json_select "$ID"; then json_get_var UPDATED updated; json_select ..; fi
+  case "$UPDATED" in ''|*[!0-9]*) UPDATED=0;; esac
+  # Future timestamps (clock correction) never suppress refresh indefinitely.
+  if [ "$UPDATED" -gt "$NOW" ] || [ $((NOW - UPDATED)) -ge 86400 ]; then DUE=1; fi
+ done
+ [ "$DUE" = 1 ] || return 0
+ worker_alive && "$CTL" running >/dev/null 2>&1 || return 0
+ # Controller takes its shared control lock before the async helper launch.
+ "$CTL" update_lists </dev/null >/dev/null 2>&1 &
+ ACTION_PID=$!; wait "$ACTION_PID" 2>/dev/null; ACTION_PID=''
+}
+while worker_alive; do
+ maybe_update
+ # 24h between attempts, checked in 30s increments so an unexpectedly dead
+ # worker cannot leave an orphan timer. A normal stop kills timer immediately.
+ LEFT=86400
+ while [ "$LEFT" -gt 0 ]; do
+  worker_alive || exit 0
+  sleep 30 & SLEEP_PID=$!
+  wait "$SLEEP_PID" 2>/dev/null; SLEEP_PID=''
+  LEFT=$((LEFT - 30))
+ done
+done

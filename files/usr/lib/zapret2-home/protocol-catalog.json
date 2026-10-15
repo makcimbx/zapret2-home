@@ -1,0 +1,18 @@
+[
+  {"id":"quic","title":"QUIC / HTTP3","description":"Экспериментальные fake для QUIC Initial на UDP/443; обход и доступность HTTP/3 не подтверждены. Неверная контрольная сумма и TTL 2 меняют только fake: доставка и отбрасывание зависят от сети, возможны побочные эффекты.","profiles":[
+    {"id":"quic_google","title":"Google Initial: базовый ×6","evidence":"experimental","strategy":"fake:blob=quic_google:repeats=6"},
+    {"id":"quic_zero","title":"Штатный QUIC: базовый ×6","evidence":"experimental","strategy":"fake:blob=fake_default_quic:repeats=6"},
+    {"id":"quic_google_badsum","title":"Google Initial: неверная контрольная сумма ×6","evidence":"experimental","strategy":"fake:blob=quic_google:repeats=6:badsum"},
+    {"id":"quic_google_ttl2","title":"Google Initial: TTL 2 ×6","evidence":"experimental","strategy":"fake:blob=quic_google:repeats=6:ip_ttl=2"},
+    {"id":"quic_zero_badsum","title":"Штатный QUIC: неверная контрольная сумма ×6","evidence":"experimental","strategy":"fake:blob=fake_default_quic:repeats=6:badsum"},
+    {"id":"quic_zero_ttl2","title":"Штатный QUIC: TTL 2 ×6","evidence":"experimental","strategy":"fake:blob=fake_default_quic:repeats=6:ip_ttl=2"}
+  ]},
+  {"id":"udp","title":"UDP / voice","description":"Экспериментальные fake только для Discord IP discovery и STUN на фиксированных портах; не проверка голоса или медиатрафика. Нулевые ×2 и ×6 отличаются лишь числом повторов, не алгоритмом. Неверная контрольная сумма и TTL 2 меняют только fake: доставка и отбрасывание зависят от сети, возможны побочные эффекты. Обход не подтверждён.","profiles":[
+    {"id":"udp_fake2","title":"Нулевой fake: базовый ×2","evidence":"experimental","strategy":"fake:blob=0x00000000000000000000000000000000:repeats=2"},
+    {"id":"udp_fake6","title":"Нулевой fake: базовый ×6 (только больше повторов)","evidence":"experimental","strategy":"fake:blob=0x00000000000000000000000000000000:repeats=6"},
+    {"id":"udp_protocol_fake2","title":"Discord / STUN fake: базовый ×2","evidence":"experimental","strategy":"fake:blob=discord_discovery:repeats=2 + fake:blob=stun_binding:repeats=2"},
+    {"id":"udp_badsum2","title":"Нулевой fake: неверная контрольная сумма ×2","evidence":"experimental","strategy":"fake:blob=0x00000000000000000000000000000000:repeats=2:badsum"},
+    {"id":"udp_ttl2","title":"Нулевой fake: TTL 2 ×2","evidence":"experimental","strategy":"fake:blob=0x00000000000000000000000000000000:repeats=2:ip_ttl=2"},
+    {"id":"udp_protocol_badsum2","title":"Discord / STUN fake: неверная контрольная сумма ×2","evidence":"experimental","strategy":"fake:blob=discord_discovery:repeats=2:badsum + fake:blob=stun_binding:repeats=2:badsum"}
+  ]}
+]

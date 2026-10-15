@@ -1,0 +1,306 @@
+#!/bin/sh
+# Admission-ABI: 1
+# Root-only fixed community catalog. No URLs, user shell or profiles accepted.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+LIB=/usr/lib/zapret2-home
+RUN=/var/run/zapret2-home
+CACHE=/etc/zapret2-home/lists
+SELF=/usr/libexec/zapret2-home-lists
+CTL=/usr/libexec/zapret2-home-ctl
+CATALOG=/usr/share/zapret2-home/lists.json
+LOCK="$RUN/list-update.lock"
+IDS='flowseal cloudflare hetzner cloudfront ovh digitalocean'
+. /usr/share/libubox/jshn.sh
+mkdir -p "$RUN" || exit 1
+chmod 700 "$RUN" || exit 1
+STAGE=''; NEW=''; SWAPPED=0; OLD=''; ACK=''; CHILD=''; DOWNLOAD_PID=''; APPLY_PID=''
+json_error() { json_init; json_add_boolean ok 0; json_add_string error "$1"; json_dump; printf '\n'; return 1; }
+record_error() { printf '%.240s\n' "$1" >"$RUN/list-error"; }
+owner_alive() {
+ [ -f "$LOCK/pid" ] || return 1
+ read -r OWNER <"$LOCK/pid"
+ case "$OWNER" in ''|*[!0-9]*) return 1;; esac
+ kill -0 "$OWNER" 2>/dev/null
+}
+# One guard also serializes lifecycle freeze with updater admission/handoff.
+lock_state() { ucode "$LIB/lock.uc" "$1" list-update "$$" "$2" "$3" 2>/dev/null; }
+reap_stale() { lock_state reap; }
+acquire() { lock_state acquire; }
+release() { lock_state release; }
+point_current() {
+ # mv -T is supported by OpenWrt BusyBox; do not follow current's directory symlink.
+ ln -s "$1" "$CACHE/.current.$$" && mv -Tf "$CACHE/.current.$$" "$CACHE/current"
+}
+restore_cache_rules() {
+ if { [ -n "$OLD" ] && point_current "$OLD"; } || { [ -z "$OLD" ] && rm -f "$CACHE/current"; }; then
+  if "$CTL" reconcile-running >"$RUN/list-rollback.log" 2>&1; then
+   SWAPPED=0; return 0
+  fi
+  record_error 'CRITICAL: previous cache restored but live-rule rollback failed'
+ else
+  record_error 'CRITICAL: cache rollback failed'
+ fi
+ NEW=''; return 1
+}
+cleanup() {
+ trap - EXIT HUP INT TERM
+ # Let an in-flight atomic nft apply settle before restoring either resource.
+ [ -n "$APPLY_PID" ] && { wait "$APPLY_PID" 2>/dev/null; APPLY_PID=''; }
+ # The curl subshell execs curl, so this is the actual downloader PID. Reap it
+ # before releasing ownership: no orphan request can overlap the next updater.
+ if [ -n "$DOWNLOAD_PID" ]; then kill "$DOWNLOAD_PID" 2>/dev/null; wait "$DOWNLOAD_PID" 2>/dev/null; fi
+ if [ "$SWAPPED" = 1 ]; then
+  if restore_cache_rules; then record_error 'Update interrupted; previous cache and live rules restored'; fi
+ fi
+ [ -n "$STAGE" ] && rm -rf "$STAGE"
+ [ -n "$NEW" ] && rm -rf "$NEW"
+ rm -f "$CACHE/.current.$$" 2>/dev/null
+ release
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+selected() {
+ S=$(uci -q get zapret2_home.main.lists 2>/dev/null) || S=''
+ # Shell glob expansion MUST remain disabled for untrusted UCI text.
+ set -f
+ SEL=''
+ for ID in $S; do
+  case "$ID" in flowseal|cloudflare|hetzner|cloudfront|ovh|digitalocean) :;; *) return 1;; esac
+ done
+ # Stable canonical order and deduplication, independent of UCI whitespace/order.
+ for ID in $IDS; do
+  for CHOICE in $S; do [ "$CHOICE" = "$ID" ] && { SEL="$SEL $ID"; break; }; done
+ done
+ SEL=${SEL# }
+}
+url_for() {
+ case "$1" in
+ flowseal) URL='https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/.service/ipset-service.txt';;
+ cloudflare|hetzner|cloudfront|ovh|digitalocean) URL="https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/$1.lst";;
+ *) return 1;;
+ esac
+}
+current_snapshot() {
+ SNAP=''
+ [ -L "$CACHE/current" ] || return 1
+ SNAP=$(readlink "$CACHE/current")
+ case "$SNAP" in snapshot.*) :;; *) return 1;; esac
+ case "$SNAP" in *[!a-zA-Z0-9._-]*) return 1;; esac
+ [ -d "$CACHE/$SNAP" ]
+}
+validate_cached() {
+ current_snapshot || return 1
+ for ID in $SEL; do
+  [ -f "$CACHE/$SNAP/$ID.list" ] && [ ! -L "$CACHE/$SNAP/$ID.list" ] || return 1
+  [ -f "$CACHE/$SNAP/$ID.json" ] && [ ! -L "$CACHE/$SNAP/$ID.json" ] || return 1
+  json_load "$(dd if="$CACHE/$SNAP/$ID.json" bs=4096 count=1 2>/dev/null)" || return 1
+  # This root-only, immutable snapshot is produced by normalize below. The
+  # versioned approval + digest avoids reinterpreting 26k validated lines on
+  # every status/check/start. A legacy/unapproved cache must be refreshed.
+  json_get_var FORMAT format_version
+  [ "$FORMAT" = 1 ] || return 1
+  json_get_var EXPECT sha256
+  HASH=$(sha256sum "$CACHE/$SNAP/$ID.list"); HASH=${HASH%% *}
+  [ "$HASH" = "$EXPECT" ] || return 1
+ done
+}
+collect_elements() {
+ # Stage all reads before validation so a missing/read-failed later source can
+ # never cause partial stdout. A unique tmpfs directory is cleaned on EXIT.
+ STAGE="$RUN/list-elements.$$"
+ mkdir "$STAGE" || return 1
+ for ID in $SEL; do dd if="$CACHE/$SNAP/$ID.list" >>"$STAGE/union" 2>/dev/null || return 1; done
+}
+ensure() {
+ selected || return 1
+ [ -z "$SEL" ] && return 0
+ validate_cached && collect_elements || return 1
+ bounded_union
+}
+bounded_union() {
+ SIZE=$(wc -c <"$STAGE/union"); LINES=$(wc -l <"$STAGE/union")
+ [ "$SIZE" -le 2097152 ] && [ "$LINES" -le 60000 ] && [ "$LINES" -gt 0 ]
+}
+elements() {
+ selected || return 1
+ [ -z "$SEL" ] && return 0
+ validate_cached && collect_elements || return 1
+ # Only approved, SHA-verified normalized snapshots reach this native union;
+ # downloaded text always goes through the full parser before approval.
+ bounded_union && LC_ALL=C sort -u "$STAGE/union"
+}
+status() {
+ current_snapshot || SNAP=''
+ json_init
+ json_add_object list_state
+ for ID in $IDS; do
+  COUNT=0; UPDATED=0; HASH=''; SOURCE=0; DISCARD=0; ERROR=''
+  META="$CACHE/$SNAP/$ID.json"
+  [ -f "$RUN/list-meta.$ID" ] && META="$RUN/list-meta.$ID"
+  if [ -f "$META" ]; then
+   # Isolate jshn parser state from the output tree.
+   M=$(dd if="$META" bs=4096 count=1 2>/dev/null)
+   VALUES=$(ucode -e 'let x; try { x=json(ARGV[0]); } catch(e) { exit(1); } if(type(x)!="object") exit(1); print(sprintf("%d %d %s %d %d",x.count||0,x.updated||0,x.sha256||"-",x.source_count||0,x.discarded||0));' "$M" 2>/dev/null)
+   read -r COUNT UPDATED HASH SOURCE DISCARD <<EOF
+$VALUES
+EOF
+   [ "$HASH" = '-' ] && HASH=''
+  else ERROR='Cache not downloaded'; fi
+  if [ -f "$RUN/list-checked.$ID" ]; then read -r UPDATED <"$RUN/list-checked.$ID"; fi
+  json_add_object "$ID"
+  json_add_int count "${COUNT:-0}"; json_add_int updated "${UPDATED:-0}"
+  json_add_string sha256 "$HASH"; json_add_string error "$ERROR"
+  json_add_int source_count "${SOURCE:-0}"; json_add_int discarded "${DISCARD:-0}"
+  json_close_object
+ done
+ json_close_object
+ ACTIVE=0
+ if [ -d "$LOCK" ]; then
+  if owner_alive || ! reap_stale; then ACTIVE=1; fi
+ fi
+ ERROR=''; [ -f "$RUN/list-error" ] && ERROR=$(dd if="$RUN/list-error" bs=240 count=1 2>/dev/null)
+ LAST=0
+ if [ -f "$RUN/list-success" ]; then read -r LAST <"$RUN/list-success"
+ elif [ -n "$SNAP" ] && [ -f "$CACHE/$SNAP/success" ]; then read -r LAST <"$CACHE/$SNAP/success"; fi
+ case "$LAST" in ''|*[!0-9]*) LAST=0;; esac
+ json_add_boolean update_running "$ACTIVE"; json_add_string update_error "$ERROR"; json_add_int last_success "$LAST"
+ json_dump; printf '\n'
+}
+update_run() {
+ if [ "$1" = '--handoff' ]; then
+  case "$2" in ''|*[!0-9]*) return 1;; esac
+  lock_state handoff "$2" "$3" || return 1
+  ACK="$RUN/list-launch.$2"
+  exec </dev/null >"$RUN/list-update.log" 2>&1
+ else acquire || { json_error 'List updater is busy'; return 1; }; fi
+ selected || { record_error 'Unknown selected list ID'; return 1; }
+ SAVED_SEL="$SEL"
+ record_error 'Update did not complete'
+ STAGE="$RUN/list-stage.$$"
+ mkdir "$STAGE" || { record_error 'Cannot create staging directory'; return 1; }
+ [ -n "$ACK" ] && printf '%s\n' accepted >"$ACK"
+ CHANGED=0; NOW=$(date +%s)
+ current_snapshot && OLD="$SNAP"
+ for ID in $SAVED_SEL; do
+  url_for "$ID" || return 1
+  # No redirects, curlrc, proxy environment, auth, or insecure TLS. A file-size
+  # rlimit also bounds chunked replies on older curl (<=2MiB on ash/dash).
+  (ulimit -f 2048 || exit 1; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; exec curl -q --proxy '' --proto '=https' --tlsv1.2 --fail --silent --show-error --connect-timeout 15 --max-time 60 --limit-rate 256K --max-filesize 2097152 --output "$STAGE/$ID.raw" "$URL") >"$STAGE/download.log" 2>&1 &
+  DOWNLOAD_PID=$!
+  wait "$DOWNLOAD_PID"; DOWNLOAD_RC=$?; DOWNLOAD_PID=''
+  if [ "$DOWNLOAD_RC" != 0 ]; then
+   record_error "$ID: HTTPS download failed (timeout/size/TLS/network)"; return 1
+  fi
+  if ! ucode "$LIB/netlist.uc" normalize <"$STAGE/$ID.raw" >"$STAGE/$ID.list" 2>"$STAGE/$ID.validation"; then
+   record_error "$ID: invalid or empty IPv4 list"; return 1
+  fi
+  json_load "$(dd if="$STAGE/$ID.validation" bs=4096 count=1 2>/dev/null)" || { record_error "$ID: invalid validator metadata"; return 1; }
+  json_get_var COUNT count; json_get_var SOURCE source_count; json_get_var DISCARD discarded
+  HASH=$(sha256sum "$STAGE/$ID.list"); HASH=${HASH%% *}
+  json_init; json_add_int format_version 1; json_add_int count "$COUNT"; json_add_int source_count "$SOURCE"; json_add_int discarded "$DISCARD"
+  json_add_int updated "$NOW"; json_add_string sha256 "$HASH"; json_add_string error ''
+  json_dump >"$STAGE/$ID.json"
+  BEFORE=''
+  if [ -n "$OLD" ] && [ -f "$CACHE/$OLD/$ID.list" ]; then BEFORE=$(sha256sum "$CACHE/$OLD/$ID.list"); BEFORE=${BEFORE%% *}; fi
+  PREVIOUS_HASH=''; PREVIOUS_FORMAT=''
+  if [ -n "$OLD" ] && [ -f "$CACHE/$OLD/$ID.json" ]; then
+   if json_load "$(dd if="$CACHE/$OLD/$ID.json" bs=4096 count=1 2>/dev/null)"; then json_get_var PREVIOUS_HASH sha256; json_get_var PREVIOUS_FORMAT format_version; fi
+  fi
+  if [ "$BEFORE" != "$HASH" ] || [ "$PREVIOUS_HASH" != "$HASH" ] || [ "$PREVIOUS_FORMAT" != 1 ]; then
+   CHANGED=1; touch "$STAGE/$ID.changed"
+  fi
+ done
+ # Aggregate guard: complete selected union is bounded/validated before commit.
+ if [ -n "$SAVED_SEL" ]; then
+  { for ID in $SAVED_SEL; do dd if="$STAGE/$ID.list" 2>/dev/null; done; } | ucode "$LIB/netlist.uc" check >/dev/null 2>&1 || { record_error 'Selected union exceeds limits or is invalid'; return 1; }
+ fi
+ selected && [ "$SEL" = "$SAVED_SEL" ] || { record_error 'List selection changed during download; cache untouched'; return 1; }
+ if [ "$CHANGED" = 1 ]; then
+  mkdir -p "$CACHE" && chmod 700 "$CACHE" || { record_error 'Cannot create protected persistent cache'; return 1; }
+  NAME="snapshot.$NOW.$$"; NEW="$CACHE/$NAME"
+  mkdir "$NEW" || return 1
+  if [ -n "$OLD" ]; then cp -al "$CACHE/$OLD/." "$NEW/" || { record_error 'Cannot stage previous snapshot'; return 1; }; fi
+  for ID in $SAVED_SEL; do
+   [ -f "$STAGE/$ID.changed" ] || continue
+   # Remove copied hardlinks before replacing, never truncate old generation.
+   rm -f "$NEW/$ID.list" "$NEW/$ID.json"
+   cp "$STAGE/$ID.list" "$NEW/$ID.list" && cp "$STAGE/$ID.json" "$NEW/$ID.json" || { record_error 'Cache write failed'; return 1; }
+  done
+  rm -f "$NEW/success"; printf '%s\n' "$NOW" >"$NEW/success" || return 1
+  selected && [ "$SEL" = "$SAVED_SEL" ] || { record_error 'List selection changed before commit; cache untouched'; return 1; }
+  point_current "$NAME" || { record_error 'Atomic cache commit failed'; return 1; }
+  SWAPPED=1
+  if "$CTL" running >/dev/null 2>&1; then
+   "$CTL" reconcile-running >"$STAGE/reconcile.log" 2>&1 &
+   APPLY_PID=$!
+   wait "$APPLY_PID"; APPLY_RC=$?; APPLY_PID=''
+   if [ "$APPLY_RC" != 0 ]; then
+    if restore_cache_rules; then record_error 'nft reconcile failed; previous cache and live rules restored'; fi
+    return 1
+   fi
+  fi
+  SWAPPED=0; NEW=''
+  # Retain the previous generation for concurrent readers; remove only older
+  # owned snapshots. At most current+previous (bounded catalog/entry limits).
+  for DIR in "$CACHE"/snapshot.*; do
+   [ -d "$DIR" ] && [ ! -L "$DIR" ] || continue
+   [ "$DIR" = "$CACHE/$NAME" ] || [ "$DIR" = "$CACHE/$OLD" ] || rm -rf "$DIR"
+  done
+ fi
+ printf '%s\n' "$NOW" >"$RUN/list-success"
+ for ID in $SAVED_SEL; do
+  printf '%s\n' "$NOW" >"$RUN/list-checked.$ID"
+  cp "$STAGE/$ID.json" "$RUN/list-meta.$ID" || return 1
+ done
+ rm -f "$RUN/list-error"
+ printf '%s\n' '{"ok":true}'
+}
+launch_update() {
+ acquire || { json_error 'List updater is busy'; return 1; }
+ selected || { json_error 'Unknown selected list ID'; return 1; }
+ read -r PARENT_TICKS <"$LOCK/ticks" || return 1
+ ACK="$RUN/list-launch.$$"
+ rm -f "$ACK"
+ if command -v nohup >/dev/null 2>&1; then
+  nohup "$SELF" update-run --handoff "$$" "$PARENT_TICKS" </dev/null >/dev/null 2>&1 &
+  CHILD=$!
+ elif command -v start-stop-daemon >/dev/null 2>&1; then
+  # BusyBox on the target has no nohup. Fixed argv, detached descriptors; the
+  # child must acknowledge PID handoff before the UI gets pending:true.
+  start-stop-daemon -S -b -x "$SELF" -- update-run --handoff "$$" "$PARENT_TICKS" || { json_error 'Detached updater launch failed'; return 1; }
+  CHILD=''
+ else
+  # Portable no-nohup fallback: ignore HUP and disconnect every stdio FD.
+  (trap '' HUP; exec "$SELF" update-run --handoff "$$" "$PARENT_TICKS") </dev/null >/dev/null 2>&1 &
+  CHILD=$!
+ fi
+ for N in 1 2 3 4 5; do
+  if [ -f "$ACK" ]; then
+   read -r RESULT <"$ACK"; rm -f "$ACK"; ACK=''
+   [ "$RESULT" = accepted ] && { printf '%s\n' '{"ok":true,"pending":true}'; return 0; }
+  fi
+  if [ -n "$CHILD" ]; then kill -0 "$CHILD" 2>/dev/null || break; fi
+  sleep 1
+ done
+ # A timed-out child is ours; wait before releasing launcher-owned lock.
+ if [ -n "$CHILD" ]; then kill "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null
+ else
+  # Detached child is not a waitable shell child. Only kill its verified owner.
+  if owner_alive && [ "$OWNER" != "$$" ]; then kill "$OWNER" 2>/dev/null; fi
+ fi
+ rm -f "$ACK"; ACK=''
+ record_error 'Asynchronous updater failed to acknowledge launch'
+ json_error 'Asynchronous updater did not start'
+}
+case "$1" in
+ catalog) [ "$#" = 1 ] || exit 1; dd if="$CATALOG" 2>/dev/null;;
+ status) [ "$#" = 1 ] || exit 1; status;;
+ ensure-idle) [ "$#" = 1 ] || exit 1; if [ -d "$LOCK" ]; then reap_stale; else exit 0; fi;;
+ ensure) [ "$#" = 1 ] || exit 1; ensure;;
+ elements) [ "$#" = 1 ] || exit 1; elements;;
+ update) [ "$#" = 1 ] || exit 1; launch_update;;
+ update-run) if [ "$#" = 1 ]; then update_run; elif [ "$#" = 4 ] && [ "$2" = '--handoff' ]; then update_run "$2" "$3" "$4"; else exit 1; fi;;
+ *) json_error 'Invalid list operation';;
+esac

@@ -1,0 +1,24 @@
+#!/bin/sh
+CTL=/usr/libexec/zapret2-home-ctl
+case "$1" in
+ list) printf '%s\n' '{"status":{},"logs":{},"check":{},"update_lists":{},"profiles_catalog":{},"profiles_status":{},"profiles_test":{"profiles":"str","targets":"str","repeat":1},"profiles_apply":{"profile":"str"},"protocols_catalog":{},"protocols_status":{},"protocols_test":{"protocol":"str","profiles":"str","targets":"str","repeat":1},"protocols_apply":{"protocol":"str","enabled":false,"profile":"str"},"configure":{"clients":"str","destinations":"str","autostart":false,"client_mode":"str","lists":"str","auto_update":false},"control":{"action":"str"}}' ;;
+ call)
+  case "$2" in
+   profiles_catalog) /usr/libexec/zapret2-home-profiles catalog ;;
+   profiles_status) /usr/libexec/zapret2-home-profiles status ;;
+   profiles_test) /usr/libexec/zapret2-home-profiles test ;;
+   profiles_apply) "$CTL" profiles-apply ;;
+   protocols_catalog) /usr/libexec/zapret2-home-profiles protocols-catalog ;;
+   protocols_status) /usr/libexec/zapret2-home-profiles protocols-status ;;
+   protocols_test) /usr/libexec/zapret2-home-profiles protocols-test ;;
+   protocols_apply) "$CTL" protocols-apply ;;
+   status|logs|check|configure|update_lists) "$CTL" "$2" ;;
+   control)
+    . /usr/share/libubox/jshn.sh
+    IFS= read -r request || true
+    if json_load "$request"; then json_get_var action action; printf '%s' "$action" | "$CTL" control; else printf '%s\n' '{"ok":false,"error":"Некорректный JSON"}'; fi ;;
+   *) printf '%s\n' '{"ok":false,"error":"Неизвестный метод"}' ;;
+  esac
+  exit 0 ;;
+ *) exit 1 ;;
+esac

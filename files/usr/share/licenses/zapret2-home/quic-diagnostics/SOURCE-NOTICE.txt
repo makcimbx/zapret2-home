@@ -1,0 +1,14 @@
+Private QUIC diagnostics engine, not a replacement for the production engine.
+Built from bol-van/zapret2 v1.0.5.2 commit 6b6c63e3385fa73f8af3be4a69171e947f5a319d.
+The sole engine C source change enables NFQA_CFG_F_GSO alongside FAIL_OPEN; patch included.
+Only isolated queue-214 QUIC diagnostics select this helper, with --reasm-disable=quic_initial.
+Main queue 213 and TCP/UDP diagnostics keep the original pinned nfqws2 binary.
+Dependencies: libmnl 1.0.5, libnfnetlink 1.0.2, libnetfilter_queue 1.0.5,
+zlib 1.3.1, OpenResty LuaJIT 2.1-20250826 (FFI disabled), GNU libc 2.39/GCC13.3.
+Static GNU libc NSS/dlopen caveats apply; numeric/default target UID and actual Lua/HTTP3
+were exercised on the target. Compiler and dependency choices differ from the original release.
+Private build records are not part of the source-only repository. Source archive hashes
+remain in the provenance JSON; exact binary reproduction is not automated by this repository.
+See adjacent notices and /usr/share/zapret2-home/quic-diagnostic-engine.json.
+This package is for the owner's private installation. No independent reproducible-build or
+complete public redistribution/source/relinking-compliance claim is made.

@@ -1,0 +1,13 @@
+{
+  "admin/services/zapret2home": {
+    "title": "zapret2-home",
+    "order": 90,
+    "action": {
+      "type": "view",
+      "path": "services/zapret2home"
+    },
+    "depends": {
+      "acl": ["luci-app-zapret2-home"]
+    }
+  }
+}

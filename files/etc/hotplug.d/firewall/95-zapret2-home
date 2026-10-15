@@ -1,0 +1,2 @@
+#!/bin/sh
+/usr/libexec/zapret2-home-ctl reconcile >/dev/null 2>&1

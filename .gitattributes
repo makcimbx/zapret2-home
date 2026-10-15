@@ -1,0 +1,4 @@
+# Preserve upstream payloads/notices and exact patch hashes without whitespace churn.
+files/usr/lib/zapret2-home/lua/* -whitespace
+files/usr/share/licenses/** -whitespace
+*.bin binary

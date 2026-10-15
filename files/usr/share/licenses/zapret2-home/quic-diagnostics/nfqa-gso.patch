@@ -1,0 +1,11 @@
+--- a/nfq2/nfqws.c
++++ b/nfq2/nfqws.c
+@@ -405,7 +405,7 @@
+ 		goto exiterr;
+ 	}
+ 	// accept packets if they cant be handled
+-	if (nfq_set_queue_flags(*qh, NFQA_CFG_F_FAIL_OPEN, NFQA_CFG_F_FAIL_OPEN))
++	if (nfq_set_queue_flags(*qh, NFQA_CFG_F_FAIL_OPEN | NFQA_CFG_F_GSO, NFQA_CFG_F_FAIL_OPEN | NFQA_CFG_F_GSO))
+ 	{
+ 		DLOG_ERR("can't set queue flags. its OK on linux <3.6\n");
+ 		// dot not fail. not supported in old linuxes <3.6 

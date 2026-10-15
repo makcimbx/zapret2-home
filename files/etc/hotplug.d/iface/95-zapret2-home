@@ -1,0 +1,5 @@
+#!/bin/sh
+case "$ACTION:$INTERFACE" in
+ ifup:wan|ifupdate:wan) /usr/libexec/zapret2-home-ctl reconcile >/dev/null 2>&1 ;;
+ ifdown:wan) /usr/libexec/zapret2-home-ctl remove >/dev/null 2>&1 ;;
+esac

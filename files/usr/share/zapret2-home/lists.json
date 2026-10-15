@@ -1,0 +1,38 @@
+[
+  {
+    "id": "flowseal",
+    "title": "Flowseal — Discord / YouTube / сервисы",
+    "description": "Большой общественный набор IPv4-подсетей; затрагивает общие CDN и соседние сервисы.",
+    "url": "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/.service/ipset-service.txt"
+  },
+  {
+    "id": "cloudflare",
+    "title": "Cloudflare",
+    "description": "Общественный список IPv4-подсетей Cloudflare от itdoginfo; не список доменов.",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/cloudflare.lst"
+  },
+  {
+    "id": "hetzner",
+    "title": "Hetzner",
+    "description": "Общественный список IPv4-подсетей Hetzner от itdoginfo; не список доменов.",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/hetzner.lst"
+  },
+  {
+    "id": "cloudfront",
+    "title": "Amazon CloudFront",
+    "description": "Общественный список IPv4-подсетей Amazon CloudFront от itdoginfo; не список доменов.",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/cloudfront.lst"
+  },
+  {
+    "id": "ovh",
+    "title": "OVH",
+    "description": "Общественный список IPv4-подсетей OVH от itdoginfo; не список доменов.",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/ovh.lst"
+  },
+  {
+    "id": "digitalocean",
+    "title": "DigitalOcean",
+    "description": "Общественный список IPv4-подсетей DigitalOcean от itdoginfo; не список доменов.",
+    "url": "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/digitalocean.lst"
+  }
+]

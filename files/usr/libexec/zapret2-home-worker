@@ -1,0 +1,57 @@
+#!/bin/sh
+# Admission-ABI: 1
+LIB=/usr/lib/zapret2-home
+RUN=/var/run/zapret2-home
+PID=''
+TIMER=''
+umask 077
+SELF=/usr/libexec/zapret2-home-worker
+mkdir -p "$RUN" || exit 1
+[ -f "$RUN/requested" ] && [ ! -f "$RUN/stopping" ] || exit 0
+# procd respawns this script directly; reclaim only a dead worker's markers.
+ucode "$LIB/lock.uc" worker-acquire '' "$$" || exit 1
+cleanup() {
+ trap - EXIT TERM INT
+ if [ -n "$TIMER" ]; then
+  if tr '\000' '\n' <"/proc/$TIMER/cmdline" 2>/dev/null | grep -Fx /usr/libexec/zapret2-home-list-timer >/dev/null; then kill "$TIMER" 2>/dev/null; fi
+  wait "$TIMER" 2>/dev/null
+ fi
+ [ -n "$PID" ] && /usr/libexec/zapret2-home-ctl remove "$PID"
+ if [ -n "$PID" ]; then kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; fi
+ read -r OLD <"$RUN/engine.pid" 2>/dev/null
+ [ "$OLD" = "$PID" ] && rm -f "$RUN/engine.pid"
+ read -r OLD <"$RUN/worker.pid" 2>/dev/null
+ if [ "$OLD" = "$$" ]; then rm -f "$RUN/worker.pid"; rmdir "$RUN/worker.lock" 2>/dev/null; fi
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT
+read -r OLD <"$RUN/engine.pid" 2>/dev/null
+case "$OLD" in ''|*[!0-9]*) OLD='';; esac
+if [ -n "$OLD" ]; then
+ /usr/libexec/zapret2-home-ctl remove "$OLD" || exit 1
+ if [ "$(readlink "/proc/$OLD/exe" 2>/dev/null)" = "$LIB/nfqws2" ]; then
+  kill "$OLD" 2>/dev/null
+  for n in 1 2 3 4 5; do
+   [ "$(readlink "/proc/$OLD/exe" 2>/dev/null)" = "$LIB/nfqws2" ] || break
+   sleep 1
+  done
+  [ "$(readlink "/proc/$OLD/exe" 2>/dev/null)" != "$LIB/nfqws2" ] || exit 1
+ fi
+ rm -f "$RUN/engine.pid"
+fi
+nice -n 10 /usr/libexec/zapret2-home-engine 213 main run &
+PID=$!
+printf '%s\n' "$PID" >"$RUN/engine.pid"
+ready=0
+for n in 1 2 3 4 5; do
+ kill -0 "$PID" 2>/dev/null || exit 1
+ while read q rest; do [ "$q" = 213 ] && ready=1; done </proc/net/netfilter/nfnetlink_queue
+ [ "$ready" = 1 ] && break
+ sleep 1
+done
+[ "$ready" = 1 ] || exit 1
+/usr/libexec/zapret2-home-ctl apply "$PID" || exit 1
+logger -t zapret2-home 'Started: scoped direct IPv4 enabled protocols; VPN rules unchanged'
+/usr/libexec/zapret2-home-list-timer &
+TIMER=$!
+wait "$PID"

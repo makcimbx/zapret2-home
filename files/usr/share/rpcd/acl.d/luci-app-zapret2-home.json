@@ -1,0 +1,15 @@
+{
+  "luci-app-zapret2-home": {
+    "description": "Read zapret2-home state and manage its scoped service settings",
+    "read": {
+      "ubus": {
+        "zapret2_home": ["status", "logs", "check", "profiles_catalog", "profiles_status", "protocols_catalog", "protocols_status"]
+      }
+    },
+    "write": {
+      "ubus": {
+        "zapret2_home": ["configure", "control", "update_lists", "profiles_test", "profiles_apply", "protocols_test", "protocols_apply"]
+      }
+    }
+  }
+}
